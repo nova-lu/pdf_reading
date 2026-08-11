@@ -1,0 +1,4 @@
+PyMuPDF>=1.23.0
+pyttsx3>=2.90
+pywin32>=306
+edge-tts>=7.0.0
