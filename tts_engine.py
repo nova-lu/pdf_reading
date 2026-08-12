@@ -86,6 +86,8 @@ class TTSEngine:
 
         # SAPI5 朗读完成信号
         self._utterance_done = threading.Event()
+        # SAPI5 开始播放信号（用于同步 UI 高亮与音频播放）
+        self._utterance_started = threading.Event()
 
         # 引擎参数（主线程设置，worker 线程应用）
         self._voice_id: Optional[str] = None
@@ -261,6 +263,8 @@ class TTSEngine:
         self._pause_event.set()
         self._pause_request.clear()
         self._skip_to_index = None
+        self._utterance_started.clear()
+        self._utterance_done.clear()
 
         self._set_state(ReaderState.PLAYING)
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
@@ -281,6 +285,7 @@ class TTSEngine:
                     pass
                 # 唤醒正在 iterate 等待的 worker
                 self._utterance_done.set()
+                self._utterance_started.set()
 
             self._set_state(ReaderState.PAUSED)
 
@@ -296,6 +301,7 @@ class TTSEngine:
         self._stop_flag.set()
         self._pause_event.set()
         self._utterance_done.set()
+        self._utterance_started.set()
 
         self._set_state(ReaderState.STOPPED)
 
@@ -329,6 +335,7 @@ class TTSEngine:
                 self._set_state(ReaderState.PLAYING)
             # 解除 utterance 等待
             self._utterance_done.set()
+            self._utterance_started.set()
         else:
             # 未在播放，仅更新索引
             self._current_index = index
@@ -352,6 +359,30 @@ class TTSEngine:
         """pyttsx3 朗读完成回调（由 SAPI5 事件循环在 worker 线程中调用）。"""
         if completed:
             self._utterance_done.set()
+
+    def _on_utterance_started(self, name):
+        """
+        pyttsx3 开始朗读某句的回调（由 SAPI5 事件循环在 worker 线程中调用）。
+
+        在 SAPI5 实际开始播放音频时触发，用于同步 UI 高亮——
+        避免在 say() 之前就通知 UI 导致高亮超前于音频。
+        """
+        # 解析 say() 时传入的句子索引
+        idx = -1
+        if name and isinstance(name, str) and name.startswith("sent_"):
+            try:
+                idx = int(name[5:])
+            except ValueError:
+                pass
+
+        # 在音频实际开始播放时通知 UI
+        if 0 <= idx < len(self._sentences) and self._on_sentence_start:
+            try:
+                self._on_sentence_start(idx, self._sentences[idx])
+            except Exception:
+                pass
+
+        self._utterance_started.set()
 
     def _run_sapi5_worker(self):
         """SAPI5 后端工作循环。"""
@@ -377,8 +408,9 @@ class TTSEngine:
         self._sapi5_engine.setProperty("rate", self._rate)
         self._sapi5_engine.setProperty("volume", self._volume)
 
-        # 注册永久的 finished-utterance 回调
+        # 注册永久的事件回调
         self._sapi5_engine.connect("finished-utterance", self._on_utterance_finished)
+        self._sapi5_engine.connect("started-utterance", self._on_utterance_started)
 
         # 启动非阻塞手动事件循环
         self._sapi5_engine.startLoop(False)
@@ -415,19 +447,38 @@ class TTSEngine:
                 self._current_index += 1
                 continue
 
-            # 通知 UI：开始朗读这句
-            if self._on_sentence_start:
-                try:
-                    self._on_sentence_start(self._current_index, sentence)
-                except Exception:
-                    pass
+            # 不在这里通知 UI —— 改为等 started-utterance 回调，
+            # 确保 SAPI5 实际开始播放音频时才高亮，消除累积偏移。
 
             # 重置完成信号，开始朗读
             self._utterance_done.clear()
+            self._utterance_started.clear()
             try:
-                self._sapi5_engine.say(sentence)
+                # say() 传入 name=句索引，started-utterance 回调据此通知 UI
+                self._sapi5_engine.say(sentence, name=f"sent_{self._current_index}")
 
-                # 手动泵送事件循环，直到该句朗读完成
+                # 阶段 1：等待 started-utterance 回调（音频开始播放）
+                # 回调中会通知 UI 高亮 + set _utterance_started
+                started_wait = 0
+                while not self._utterance_started.is_set() and not self._stop_flag.is_set():
+                    if self._skip_to_index is not None or self._pause_request.is_set():
+                        break
+                    try:
+                        self._sapi5_engine.iterate()
+                    except Exception:
+                        break
+                    time.sleep(0.01)
+                    started_wait += 1
+                    if started_wait > 100:  # 1 秒超时
+                        # 超时回退：直接通知 UI（某些 SAPI5 实现可能不触发 started-utterance）
+                        if self._on_sentence_start:
+                            try:
+                                self._on_sentence_start(self._current_index, sentence)
+                            except Exception:
+                                pass
+                        break
+
+                # 阶段 2：等待 finished-utterance 回调（音频播放完成）
                 timeout_count = 0
                 pause_during_sentence = False
                 while not self._utterance_done.is_set() and not self._stop_flag.is_set():
