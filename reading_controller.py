@@ -39,6 +39,8 @@ class ReadingController:
 
         # 句子到页面的映射（全局索引 -> 页码）
         self._sentence_page_map: list[int] = []
+        # 句子在页面 clean_text 中的起止偏移（(start, end)）
+        self._sentence_offsets: list[tuple[int, int]] = []
         # 当前朗读的句子列表
         self._reading_sentences: list[str] = []
         # 朗读数据对应的起始页
@@ -73,7 +75,7 @@ class ReadingController:
 
         Args:
             on_page_change: 翻页回调，参数为目标页码 (0-based)
-            on_sentence_highlight: 高亮回调，参数为 (sentence_index, page_num, sentence_text)
+            on_sentence_highlight: 高亮回调，参数为 (sentence_index, page_num, sentence_text, start_offset, end_offset)
             on_state_change: 状态变化回调
             on_finish: 朗读完成回调
         """
@@ -116,13 +118,14 @@ class ReadingController:
 
     def _build_reading_data(self):
         """
-        构建朗读数据：句子列表 + 句子-页面映射。
+        构建朗读数据：句子列表 + 句子-页面映射 + 句子在页面 clean_text 中的偏移。
 
         - read_all_pages=True: 从当前页到文档末尾
         - read_all_pages=False: 仅当前页
         """
         self._reading_sentences = []
         self._sentence_page_map = []
+        self._sentence_offsets = []
         self._start_page = self.current_page
 
         if not self.pdf_doc:
@@ -137,10 +140,10 @@ class ReadingController:
 
         for page_num in range(start, end):
             page_text = self.pdf_doc.get_page_text_clean(page_num)
-            sentences = TTSEngine.split_sentences(page_text)
-            for s in sentences:
+            for s, s_start, s_end in TTSEngine.split_sentences_with_positions(page_text):
                 self._reading_sentences.append(s)
                 self._sentence_page_map.append(page_num)
+                self._sentence_offsets.append((s_start, s_end))
 
     # ------------------------------------------------------------------
     # 播放控制（委托给 TTS 引擎）
@@ -185,6 +188,30 @@ class ReadingController:
         """跳到上一句。"""
         if self.tts.total_sentences > 0:
             self.tts.skip_to(max(0, self.tts.current_index - 1))
+
+    def seek_to_sentence(self, index: int):
+        """拖拽进度条跳转到指定句子索引。"""
+        if not self.pdf_doc:
+            return
+        # 确保朗读数据已构建（如果未在播放则构建）
+        if self.tts.total_sentences == 0:
+            self._build_reading_data()
+            if not self._reading_sentences:
+                return
+            self.tts.load_sentences(self._reading_sentences, index)
+            self.tts.play()
+        else:
+            self.tts.skip_to(max(0, min(index, self.tts.total_sentences - 1)))
+
+    def play_selected_text(self, text: str):
+        """朗读用户选中的一段文本（独立于页面朗读模式）。"""
+        if not text or not text.strip():
+            return
+        self.stop()
+        self._reading_sentences = []
+        self._sentence_page_map = []
+        # 直接让 TTS 朗读这段文字
+        self.tts.play(text=text)
 
     def toggle_play_pause(self):
         """播放/暂停切换。"""
@@ -248,8 +275,12 @@ class ReadingController:
         """TTS 开始朗读某句时的回调（在 worker 线程中被调用）。"""
         # 检查是否需要翻页
         target_page = self.current_page
+        start_offset = -1
+        end_offset = -1
         if self._sentence_page_map and index < len(self._sentence_page_map):
             target_page = self._sentence_page_map[index]
+            if index < len(self._sentence_offsets):
+                start_offset, end_offset = self._sentence_offsets[index]
             if target_page != self.current_page:
                 self.current_page = target_page
                 if self._on_page_change:
@@ -261,7 +292,7 @@ class ReadingController:
         # 高亮回调
         if self._on_sentence_highlight:
             try:
-                self._on_sentence_highlight(index, target_page, sentence)
+                self._on_sentence_highlight(index, target_page, sentence, start_offset, end_offset)
             except Exception:
                 pass
 

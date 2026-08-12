@@ -80,6 +80,7 @@ class TTSEngine:
         # 控制信号
         self._pause_event = threading.Event()
         self._pause_event.set()  # 初始为非暂停
+        self._pause_request = threading.Event()  # 请求立即暂停（SAPI5 用 engine.stop()）
         self._stop_flag = threading.Event()
         self._skip_to_index: Optional[int] = None  # skip 目标索引
 
@@ -185,18 +186,28 @@ class TTSEngine:
     @staticmethod
     def split_sentences(text: str) -> list[str]:
         """将文本拆分为句子（支持中英文标点）。"""
+        return [s for s, _, _ in TTSEngine.split_sentences_with_positions(text)]
+
+    @staticmethod
+    def split_sentences_with_positions(text: str) -> list[tuple[str, int, int]]:
+        """
+        将文本拆分为句子，并返回每个句子在原文中的起止偏移。
+
+        Returns:
+            list of (sentence_text, start_offset, end_offset)
+        """
         if not text or not text.strip():
             return []
 
         text = text.strip()
         pattern = r"[^。！？；.!?\n]+[。！？；.!?]*"
-        sentences = re.findall(pattern, text)
+        matches = list(re.finditer(pattern, text))
 
         result = []
-        for s in sentences:
-            s = s.strip()
+        for m in matches:
+            s = m.group().strip()
             if s:
-                result.append(s)
+                result.append((s, m.start(), m.end()))
         return result
 
     # ------------------------------------------------------------------
@@ -248,6 +259,7 @@ class TTSEngine:
         # 重置控制标志
         self._stop_flag.clear()
         self._pause_event.set()
+        self._pause_request.clear()
         self._skip_to_index = None
 
         self._set_state(ReaderState.PLAYING)
@@ -255,26 +267,27 @@ class TTSEngine:
         self._worker_thread.start()
 
     def pause(self):
-        """暂停朗读。"""
+        """暂停朗读（立即停止当前音频）。"""
         if self.state == ReaderState.PLAYING:
-            # SAPI5: 调用 engine.pause() 真正暂停音频
-            if self._sapi5_engine and self._current_provider == "sapi5":
+            self._pause_event.clear()
+
+            if self._current_provider == "sapi5" and self._sapi5_engine:
+                # SAPI5 的 pause() 不会立即停止当前播放的音频，
+                # 因此改为 stop() 立即终止，恢复时从当前句重新播放。
+                self._pause_request.set()
                 try:
-                    self._sapi5_engine.pause()
+                    self._sapi5_engine.stop()
                 except Exception:
                     pass
-            # Edge-TTS: worker 的 poll 循环会检测 _pause_event 并发送 MCI pause
-            self._pause_event.clear()
+                # 唤醒正在 iterate 等待的 worker
+                self._utterance_done.set()
+
             self._set_state(ReaderState.PAUSED)
 
     def resume(self):
         """恢复朗读。"""
         if self.state == ReaderState.PAUSED:
-            if self._sapi5_engine and self._current_provider == "sapi5":
-                try:
-                    self._sapi5_engine.resume()
-                except Exception:
-                    pass
+            self._pause_request.clear()
             self._pause_event.set()
             self._set_state(ReaderState.PLAYING)
 
@@ -374,6 +387,15 @@ class TTSEngine:
             if self._stop_flag.is_set():
                 break
 
+            # 处理立即暂停请求：SAPI5 用 stop() 已终止音频，这里等待恢复
+            if self._pause_request.is_set():
+                self._pause_request.clear()
+                self._pause_event.wait()
+                if self._stop_flag.is_set():
+                    break
+                # 恢复后重播当前句
+                continue
+
             # 处理 skip 信号
             if self._skip_to_index is not None:
                 self._current_index = self._skip_to_index
@@ -407,9 +429,15 @@ class TTSEngine:
 
                 # 手动泵送事件循环，直到该句朗读完成
                 timeout_count = 0
+                pause_during_sentence = False
                 while not self._utterance_done.is_set() and not self._stop_flag.is_set():
                     # 检测 skip 信号
                     if self._skip_to_index is not None:
+                        break
+
+                    # 检测暂停请求（pause() 已调用 engine.stop()，需尽快退出）
+                    if self._pause_request.is_set():
+                        pause_during_sentence = True
                         break
 
                     try:
@@ -426,7 +454,16 @@ class TTSEngine:
                     if timeout_count > 6000:  # 安全阈值 ~60s
                         break
             except Exception:
-                pass
+                pause_during_sentence = self._pause_request.is_set()
+
+            # 如果 iterate 过程中触发了暂停请求，进入暂停等待
+            if pause_during_sentence or self._pause_request.is_set():
+                self._pause_request.clear()
+                self._pause_event.wait()
+                if self._stop_flag.is_set():
+                    break
+                # 恢复后重播当前句
+                continue
 
             # skip 信号处理：跳到目标句子
             if self._skip_to_index is not None:

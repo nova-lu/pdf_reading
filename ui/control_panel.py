@@ -17,6 +17,7 @@ from typing import Callable, Optional
 class ControlPanel:
     """右侧控制面板。"""
 
+    COLOR_PANEL = "#ffffff"
     COLOR_ACCENT = "#2563eb"
     COLOR_ACCENT_HOVER = "#1d4ed8"
     COLOR_TEXT = "#1e293b"
@@ -109,6 +110,14 @@ class ControlPanel:
         )
         self.btn_next.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
 
+        # 朗读选中内容按钮
+        self.btn_read_selection = tk.Button(
+            section, text="\u25b6 朗读选中内容", font=("Microsoft YaHei UI", 10),
+            bg="#8b5cf6", fg="white", activebackground="#7c3aed",
+            relief=tk.FLAT, bd=0, padx=10, pady=6, cursor="hand2",
+        )
+        self.btn_read_selection.pack(fill=tk.X, pady=(8, 0))
+
     # ------------------------------------------------------------------
     # 朗读进度
     # ------------------------------------------------------------------
@@ -123,8 +132,27 @@ class ControlPanel:
                                        foreground=self.COLOR_TEXT_MUTED)
         self.lbl_progress.pack(anchor=tk.W, pady=(0, 4))
 
-        self.progress_bar = ttk.Progressbar(section, mode="determinate")
-        self.progress_bar.pack(fill=tk.X, pady=(0, 10))
+        # 用 Scale 替代 Progressbar，支持拖拽跳转
+        self.progress_scale = tk.Scale(
+            section,
+            from_=0,
+            to=100,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            length=200,
+            sliderlength=14,
+            width=8,
+            bg=self.COLOR_PANEL,
+            fg="#2563eb",
+            troughcolor="#e2e8f0",
+            highlightthickness=0,
+            relief=tk.FLAT,
+            cursor="hand2",
+        )
+        self.progress_scale.pack(fill=tk.X, pady=(0, 10))
+
+        self._progress_total = 0
+        self._updating_progress = False
 
     # ------------------------------------------------------------------
     # 页面导航
@@ -204,6 +232,8 @@ class ControlPanel:
         on_rate_changed: Optional[Callable] = None,
         on_volume_changed: Optional[Callable] = None,
         on_read_range_changed: Optional[Callable] = None,
+        on_progress_seek: Optional[Callable[[int], None]] = None,
+        on_read_selection: Optional[Callable] = None,
     ):
         """设置所有控件的回调。"""
         if on_play_pause:
@@ -231,6 +261,10 @@ class ControlPanel:
             self.scale_volume.config(command=on_volume_changed)
         if on_read_range_changed:
             self.var_read_all.trace_add("write", lambda *_: on_read_range_changed())
+        if on_progress_seek:
+            self._bind_progress_seek(on_progress_seek)
+        if on_read_selection:
+            self.btn_read_selection.config(command=on_read_selection)
 
     # ------------------------------------------------------------------
     # 公共方法：状态更新
@@ -251,16 +285,38 @@ class ControlPanel:
         else:
             self.btn_play.config(text="\u25b6 播放", bg=self.COLOR_ACCENT, activebackground=self.COLOR_ACCENT_HOVER)
 
+    def _bind_progress_seek(self, callback: Callable[[int], None]):
+        """绑定进度滑块的用户拖拽/点击释放事件。"""
+        def _on_seek_release(event=None):
+            if self._updating_progress:
+                return
+            if self._progress_total <= 0:
+                return
+            pct = self.progress_scale.get()
+            target_index = int(round((pct / 100.0) * (self._progress_total - 1)))
+            target_index = max(0, min(target_index, self._progress_total - 1))
+            callback(target_index)
+
+        self.progress_scale.bind("<ButtonRelease-1>", _on_seek_release)
+        # 也响应点击轨道直接跳转
+        self.progress_scale.bind("<Button-1>", lambda e: self.progress_scale.after(50, _on_seek_release))
+
     def update_progress(self, current: int, total: int):
-        """更新进度显示。"""
+        """更新进度显示（程序更新，不触发 seek 回调）。"""
+        self._progress_total = total
         self.lbl_progress.config(text=f"第 {current + 1} / {total} 句")
         if total > 0:
-            self.progress_bar["value"] = (current / total) * 100
+            self._updating_progress = True
+            self.progress_scale.set((current / total) * 100)
+            self._updating_progress = False
 
     def clear_progress(self):
         """清除进度显示。"""
+        self._progress_total = 0
         self.lbl_progress.config(text="\u2014 / \u2014")
-        self.progress_bar["value"] = 0
+        self._updating_progress = True
+        self.progress_scale.set(0)
+        self._updating_progress = False
 
     def update_page_controls(self, current_page: int, total_pages: int):
         """更新页面导航按钮状态。"""

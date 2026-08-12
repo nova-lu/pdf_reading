@@ -64,7 +64,8 @@ class PDFVoiceReaderApp:
         # 注册控制器回调（通过队列线程安全传递）
         self.controller.set_callbacks(
             on_page_change=lambda page: self._tts_event_queue.put(("page_change", page)),
-            on_sentence_highlight=lambda idx, page, sentence: self._tts_event_queue.put(("highlight", idx, page, sentence)),
+            on_sentence_highlight=lambda idx, page, sentence, start, end:
+                self._tts_event_queue.put(("highlight", idx, page, sentence, start, end)),
             on_state_change=lambda state: self._tts_event_queue.put(("state_change", state)),
             on_finish=lambda: self._tts_event_queue.put(("finish", None)),
         )
@@ -165,7 +166,12 @@ class PDFVoiceReaderApp:
             on_rate_changed=self._on_rate_changed,
             on_volume_changed=self._on_volume_changed,
             on_read_range_changed=self._on_read_range_changed,
+            on_progress_seek=self._on_progress_seek,
+            on_read_selection=self._on_read_selection,
         )
+
+        # 文本面板右键“朗读选中内容”
+        self.text_panel.set_on_read_selection(self._on_read_selection_text)
 
     # ==================================================================
     # 状态栏
@@ -363,6 +369,27 @@ class PDFVoiceReaderApp:
     def _skip_prev(self):
         self.controller.skip_prev()
 
+    def _on_progress_seek(self, index: int):
+        """进度条拖拽跳转。"""
+        if not self.pdf_doc:
+            return
+        self.controller.seek_to_sentence(index)
+        self._set_status(f"跳转至第 {index + 1} 句")
+
+    def _on_read_selection(self):
+        """工具栏按钮：朗读当前选中的文本。"""
+        selected = self.text_panel.get_selection_text()
+        if selected:
+            self.controller.play_selected_text(selected)
+            self._set_status("朗读选中内容...")
+        else:
+            messagebox.showinfo("提示", "请先选中要朗读的文本")
+
+    def _on_read_selection_text(self, text: str):
+        """右键菜单：朗读选中的文本。"""
+        self.controller.play_selected_text(text)
+        self._set_status("朗读选中内容...")
+
     # ==================================================================
     # TTS 事件轮询（主线程安全更新 UI）
     # ==================================================================
@@ -374,7 +401,8 @@ class PDFVoiceReaderApp:
                 if event_type == "page_change":
                     self._on_event_page_change(args[0])
                 elif event_type == "highlight":
-                    self._on_event_highlight(args[0], args[1], args[2])
+                    # args = (idx, page, sentence, start_offset, end_offset)
+                    self._on_event_highlight(args[0], args[1], args[2], args[3], args[4])
                 elif event_type == "state_change":
                     self._on_event_state_change(args[0])
                 elif event_type == "finish":
@@ -389,11 +417,11 @@ class PDFVoiceReaderApp:
         self._update_page_controls()
         self._set_status(f"朗读中... 第 {page + 1} 页")
 
-    def _on_event_highlight(self, index: int, page: int, sentence: str):
+    def _on_event_highlight(self, index: int, page: int, sentence: str, start_offset: int = -1, end_offset: int = -1):
         """更新高亮和进度。"""
         total = self.controller.total_sentences
         self.control_panel.update_progress(index, total)
-        self.text_panel.highlight_sentence(sentence)
+        self.text_panel.highlight_sentence(sentence, page, start_offset, end_offset)
 
     def _on_event_state_change(self, state: ReaderState):
         """更新播放按钮。"""
