@@ -487,6 +487,92 @@ else:
 
 
 # ==================================================================
+# Test 11: skip_next 落在目标句且不会自动跳过（回归测试）
+# ==================================================================
+# 旧实现中 stop() 后的陈旧 EndStream 事件会让目标句刚 say() 就被
+# 标记为完成，worker 立即推进到下一句——表现为"下一句偶发跳过两句"。
+section("Test 11: skip_next lands on target, no auto-advance")
+
+if sapi_voices:
+    tts_sk = TTSEngine(vm)
+    tts_sk.set_voice(sapi_voices[0].id)
+    tts_sk.set_rate(200)
+
+    started_sk = []
+    tts_sk.set_callbacks(
+        on_sentence_start=lambda idx, s: started_sk.append((idx, time.time())),
+        on_state_change=lambda s: None,
+        on_finish=lambda: None,
+    )
+
+    long_sents = [
+        "This is the first sentence which is deliberately made very long so that it takes several seconds to read aloud completely.",
+        "This is the second sentence which is also quite long and should take a while to finish speaking.",
+        "This is the third sentence which is long as well and must not be skipped over.",
+        "This is the fourth and final sentence which is long enough for our testing purposes.",
+    ]
+    tts_sk.play(sentences=long_sents)
+    time.sleep(0.8)          # 句子 0 已开始播放
+    t_skip = time.time()
+    tts_sk.skip_to(1)        # 相当于点击一次"下一句"
+    time.sleep(1.0)
+    tts_sk.stop()
+
+    after_sk = [i for i, t in started_sk if t >= t_skip]
+    print(f"  Started after skip_next: {after_sk}")
+    record("skip_next plays target sentence", 1 in after_sk, f"after={after_sk}")
+    record("skip_next does NOT auto-advance", all(i <= 1 for i in after_sk),
+           f"after={after_sk}")
+    record("skip_next spoken index correct", tts_sk.current_index == 1,
+           f"current_index={tts_sk.current_index}")
+    tts_sk.shutdown()
+else:
+    record("skip_next regression", False, "No SAPI5 voices")
+
+
+# ==================================================================
+# Test 12: skip_prev 回到上一句且不跳向下一句（回归测试）
+# ==================================================================
+# 旧实现中点击"上一句"后，陈旧事件会让高亮跳到下一句而语音停在原地。
+section("Test 12: skip_prev returns to previous sentence")
+
+if sapi_voices:
+    tts_sk2 = TTSEngine(vm)
+    tts_sk2.set_voice(sapi_voices[0].id)
+    tts_sk2.set_rate(200)
+
+    started_sk2 = []
+    tts_sk2.set_callbacks(
+        on_sentence_start=lambda idx, s: started_sk2.append((idx, time.time())),
+        on_state_change=lambda s: None,
+        on_finish=lambda: None,
+    )
+    tts_sk2.play(sentences=long_sents)
+    time.sleep(0.8)
+    tts_sk2.skip_to(2)      # 跳到句子 2
+    # 等待句子 2 的音频真正开始（spoken index 到达 2）
+    for _ in range(100):
+        if tts_sk2.current_index == 2:
+            break
+        time.sleep(0.02)
+    t_prev = time.time()
+    tts_sk2.skip_to(tts_sk2.current_index - 1)   # 模拟"上一句"
+    time.sleep(1.0)
+    tts_sk2.stop()
+
+    after_prev = [i for i, t in started_sk2 if t >= t_prev]
+    print(f"  Started after skip_prev: {after_prev}")
+    record("skip_prev plays previous sentence", 1 in after_prev, f"after={after_prev}")
+    record("skip_prev does NOT jump forward", all(i <= 1 for i in after_prev),
+           f"after={after_prev}")
+    record("skip_prev spoken index correct", tts_sk2.current_index == 1,
+           f"current_index={tts_sk2.current_index}")
+    tts_sk2.shutdown()
+else:
+    record("skip_prev regression", False, "No SAPI5 voices")
+
+
+# ==================================================================
 # Summary
 # ==================================================================
 section("Summary")

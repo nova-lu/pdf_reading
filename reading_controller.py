@@ -180,12 +180,23 @@ class ReadingController:
         self.tts.stop()
 
     def skip_next(self):
-        """跳到下一句。"""
+        """
+        跳到下一句。
+
+        基准是 tts.current_index —— 即【音频已真正开始播放】的句子索引，
+        而不是 worker 内部提前推进的索引，避免在句子切换瞬间点"下一句"
+        时跳过两句。
+        """
         if self.tts.total_sentences > 0:
             self.tts.skip_to(self.tts.current_index + 1)
 
     def skip_prev(self):
-        """跳到上一句。"""
+        """
+        跳到上一句。
+
+        与 skip_next 相同，以实际已播放的句子为基准回退，
+        确保高亮与语音同时回到前一句。
+        """
         if self.tts.total_sentences > 0:
             self.tts.skip_to(max(0, self.tts.current_index - 1))
 

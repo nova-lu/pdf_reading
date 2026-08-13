@@ -4,9 +4,13 @@ TTS 语音合成引擎模块（重构版）
 核心改进：
 1. 双后端支持：SAPI5（pyttsx3 本地语音）+ Edge-TTS（在线神经语音）
 2. skip_to 不再杀线程重建，用 _skip_to_index 信号在 worker 内跳转
-3. pause/resume 使用 engine.pause()/resume() 真正暂停 SAPI5 音频
+3. pause/resume 使用 engine.stop() 立即停止音频，恢复时重播当前句
 4. Edge-TTS 通过 MCI (Windows Media Control Interface) 播放 MP3
 5. 持久 worker 线程，play/skip/pause 不需要重建引擎
+6. UI 同步以"音频真正开始"为准：SAPI5 用首个 started-word（StartStream）
+   事件、Edge-TTS 用 MCI playing 状态，避免高亮提前于语音
+7. stop()/skip() 后必须排空 SAPI5 陈旧 EndStream 事件再 say() 下一句，
+   否则新句子会被误判为立即完成（表现为跳过/跳回错误句子）
 
 关键技术点：
 - SAPI5 是基于 COM 的，pyttsx3 引擎必须在调用线程内创建并初始化 COM
@@ -89,6 +93,15 @@ class TTSEngine:
         # SAPI5 开始播放信号（用于同步 UI 高亮与音频播放）
         self._utterance_started = threading.Event()
 
+        # 当前已真正开始播放（音频出声）的句子索引——导航按钮以此为基准
+        self._spoken_index = 0
+        # SAPI5 首个 word 事件（StartStream）是否已到达
+        self._word_seen = False
+        # 当前 say() 对应的句子索引（word 事件不带索引，靠时序关联）
+        self._pending_utterance_index = -1
+        # 最近一次 SAPI5 finished-utterance 事件时间（用于判断事件队列静默）
+        self._last_finish_event = 0.0
+
         # 引擎参数（主线程设置，worker 线程应用）
         self._voice_id: Optional[str] = None
         self._rate: int = 200
@@ -125,7 +138,14 @@ class TTSEngine:
 
     @property
     def current_index(self) -> int:
-        return self._current_index
+        """
+        当前【真正在播放】的句子索引（音频已出声）。
+
+        注意：worker 线程内部推进的 _current_index 会在音频开始前就
+        指向下一句，若用它做导航基准会出现"下一句跳过两句"的问题，
+        因此对外统一暴露音频已实际开始播放的 _spoken_index。
+        """
+        return self._spoken_index
 
     @property
     def total_sentences(self) -> int:
@@ -221,12 +241,14 @@ class TTSEngine:
         self.stop()
         self._sentences = self.split_sentences(text)
         self._current_index = max(0, min(start_index, len(self._sentences) - 1)) if self._sentences else 0
+        self._spoken_index = self._current_index
 
     def load_sentences(self, sentences: list[str], start_index: int = 0):
         """直接加载句子列表（避免重复拆分）。"""
         self.stop()
         self._sentences = list(sentences)
         self._current_index = max(0, min(start_index, len(self._sentences) - 1)) if self._sentences else 0
+        self._spoken_index = self._current_index
 
     def play(self, text: Optional[str] = None, start_index: int = 0, sentences: Optional[list[str]] = None):
         """开始朗读。可传入 text（自动拆句）或 sentences（直接使用）。"""
@@ -267,6 +289,7 @@ class TTSEngine:
         self._utterance_done.clear()
 
         self._set_state(ReaderState.PLAYING)
+        self._spoken_index = self._current_index
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker_thread.start()
 
@@ -339,6 +362,7 @@ class TTSEngine:
         else:
             # 未在播放，仅更新索引
             self._current_index = index
+            self._spoken_index = index
 
     # ------------------------------------------------------------------
     # 工作线程入口
@@ -357,32 +381,77 @@ class TTSEngine:
 
     def _on_utterance_finished(self, name, completed):
         """pyttsx3 朗读完成回调（由 SAPI5 事件循环在 worker 线程中调用）。"""
+        self._last_finish_event = time.time()
         if completed:
             self._utterance_done.set()
 
+    def _sapi5_drain_events(self):
+        """
+        排空 SAPI5 挂起事件（在 stop()/跳过之后、下一次 say() 之前必须调用）。
+
+        原因：pyttsx3 的 engine.stop() 通过 Speak("", 3) 冲刷队列，会异步产生
+        【两个】EndStream 事件：一个终止当前句、另一个来自空流本身。后者是
+        异步投递的，若未等它处理完就 say() 下一句，它会被误判为新句子的
+        完成事件（completed=True），导致新句子刚 say() 就被标记为 finished——
+        表现为"下一句跳过两句"、"上一句跳回错误位置"、"恢复播放后当前句被吞掉"。
+
+        排空策略：持续泵送事件，直到驱动内部 _speaking 复位 且 最近 150ms
+        内没有新的完成事件（事件队列进入静默期），确保陈旧事件全部处理完。
+        """
+        if not self._sapi5_engine:
+            return
+        driver = getattr(self._sapi5_engine.proxy, "_driver", None)
+        self._last_finish_event = time.time()
+        deadline = time.time() + 1.0  # 最多排空约 1s
+        while time.time() < deadline:
+            try:
+                self._sapi5_engine.iterate()
+            except Exception:
+                break
+            time.sleep(0.01)
+            if driver is not None and not driver._speaking \
+                    and (time.time() - self._last_finish_event) > 0.15:
+                # 事件队列已静默，陈旧事件全部处理完
+                return
+
+    def _sapi5_stop_and_drain(self):
+        """停止当前音频并排空陈旧事件（skip 跳转时使用）。"""
+        try:
+            self._sapi5_engine.stop()
+        except Exception:
+            pass
+        self._sapi5_drain_events()
+
     def _on_utterance_started(self, name):
         """
-        pyttsx3 开始朗读某句的回调（由 SAPI5 事件循环在 worker 线程中调用）。
-
-        在 SAPI5 实际开始播放音频时触发，用于同步 UI 高亮——
-        避免在 say() 之前就通知 UI 导致高亮超前于音频。
+        pyttsx3 的 SAPI5 驱动会在 say() 时【同步】触发 started-utterance，
+        此时音频尚未开始合成/播放，若用它通知 UI 会导致高亮提前于语音。
+        真正的"音频开始"信号是 started-word 事件（StartStream）。
+        保留该回调仅为兼容，不再做任何 UI 通知。
         """
-        # 解析 say() 时传入的句子索引
-        idx = -1
-        if name and isinstance(name, str) and name.startswith("sent_"):
-            try:
-                idx = int(name[5:])
-            except ValueError:
-                pass
 
-        # 在音频实际开始播放时通知 UI
-        if 0 <= idx < len(self._sentences) and self._on_sentence_start:
+    def _on_word_started(self, name=None, location=None, length=None):
+        """
+        SAPI5 事件回调：首个 started-word 事件对应 StartStream，
+        表示音频流真正开始输出。此时才通知 UI 高亮，与语音精确对齐。
+        后续逐词事件一律忽略（_word_seen 已置位）。
+        """
+        if self._word_seen:
+            return
+        self._word_seen = True
+        idx = self._pending_utterance_index
+        if 0 <= idx < len(self._sentences):
+            self._notify_sentence_start(idx, self._sentences[idx])
+        self._utterance_started.set()
+
+    def _notify_sentence_start(self, index: int, sentence: str):
+        """通知 UI 某句开始播放，并更新『已播放索引』（导航基准）。"""
+        self._spoken_index = index
+        if self._on_sentence_start:
             try:
-                self._on_sentence_start(idx, self._sentences[idx])
+                self._on_sentence_start(index, sentence)
             except Exception:
                 pass
-
-        self._utterance_started.set()
 
     def _run_sapi5_worker(self):
         """SAPI5 后端工作循环。"""
@@ -411,6 +480,7 @@ class TTSEngine:
         # 注册永久的事件回调
         self._sapi5_engine.connect("finished-utterance", self._on_utterance_finished)
         self._sapi5_engine.connect("started-utterance", self._on_utterance_started)
+        self._sapi5_engine.connect("started-word", self._on_word_started)
 
         # 启动非阻塞手动事件循环
         self._sapi5_engine.startLoop(False)
@@ -422,6 +492,9 @@ class TTSEngine:
             # 处理立即暂停请求：SAPI5 用 stop() 已终止音频，这里等待恢复
             if self._pause_request.is_set():
                 self._pause_request.clear()
+                # 排空 pause() 的 engine.stop() 产生的陈旧事件，
+                # 否则恢复后重播当前句会被误判为立即完成
+                self._sapi5_drain_events()
                 self._pause_event.wait()
                 if self._stop_flag.is_set():
                     break
@@ -432,33 +505,42 @@ class TTSEngine:
             if self._skip_to_index is not None:
                 self._current_index = self._skip_to_index
                 self._skip_to_index = None
-                try:
-                    self._sapi5_engine.stop()
-                except Exception:
-                    pass
+                # stop 后必须先排空陈旧事件，否则下一句会被误判为立即完成
+                self._sapi5_stop_and_drain()
                 continue
 
             self._pause_event.wait()
             if self._stop_flag.is_set():
                 break
 
+            # 处理两句之间的暂停请求（pause 可能落在两句之间的窗口）
+            if self._pause_request.is_set():
+                self._pause_request.clear()
+                self._sapi5_drain_events()
+                self._pause_event.wait()
+                if self._stop_flag.is_set():
+                    break
+                continue
+
             sentence = self._sentences[self._current_index]
             if not sentence.strip():
                 self._current_index += 1
                 continue
 
-            # 不在这里通知 UI —— 改为等 started-utterance 回调，
-            # 确保 SAPI5 实际开始播放音频时才高亮，消除累积偏移。
+            # 不在这里通知 UI —— 改为等首个 started-word 事件（StartStream），
+            # 确保 SAPI5 音频真正开始输出时才高亮，消除提前/累积偏移。
 
             # 重置完成信号，开始朗读
             self._utterance_done.clear()
             self._utterance_started.clear()
+            self._word_seen = False
+            self._pending_utterance_index = self._current_index
             try:
-                # say() 传入 name=句索引，started-utterance 回调据此通知 UI
+                # say() 传入 name=句索引；音频真正开始的信号是 started-word
                 self._sapi5_engine.say(sentence, name=f"sent_{self._current_index}")
 
-                # 阶段 1：等待 started-utterance 回调（音频开始播放）
-                # 回调中会通知 UI 高亮 + set _utterance_started
+                # 阶段 1：等待首个 word 事件（StartStream，音频真正开始输出）
+                # 事件回调中会通知 UI 高亮 + set _utterance_started
                 started_wait = 0
                 while not self._utterance_started.is_set() and not self._stop_flag.is_set():
                     if self._skip_to_index is not None or self._pause_request.is_set():
@@ -470,12 +552,8 @@ class TTSEngine:
                     time.sleep(0.01)
                     started_wait += 1
                     if started_wait > 100:  # 1 秒超时
-                        # 超时回退：直接通知 UI（某些 SAPI5 实现可能不触发 started-utterance）
-                        if self._on_sentence_start:
-                            try:
-                                self._on_sentence_start(self._current_index, sentence)
-                            except Exception:
-                                pass
+                        # 超时回退：极少数无发音词的句子可能没有 word 事件
+                        self._notify_sentence_start(self._current_index, sentence)
                         break
 
                 # 阶段 2：等待 finished-utterance 回调（音频播放完成）
@@ -510,6 +588,9 @@ class TTSEngine:
             # 如果 iterate 过程中触发了暂停请求，进入暂停等待
             if pause_during_sentence or self._pause_request.is_set():
                 self._pause_request.clear()
+                # pause() 已调用 engine.stop()，先排空其产生的陈旧事件，
+                # 否则恢复后重播当前句会被误判为立即完成
+                self._sapi5_drain_events()
                 self._pause_event.wait()
                 if self._stop_flag.is_set():
                     break
@@ -520,10 +601,8 @@ class TTSEngine:
             if self._skip_to_index is not None:
                 self._current_index = self._skip_to_index
                 self._skip_to_index = None
-                try:
-                    self._sapi5_engine.stop()
-                except Exception:
-                    pass
+                # stop 后必须先排空陈旧事件，否则目标句会被误判为立即完成
+                self._sapi5_stop_and_drain()
                 continue
 
             if self._stop_flag.is_set():
@@ -599,16 +678,14 @@ class TTSEngine:
                 self._cleanup_temp(temp_file)
                 break
 
-            # 通知 UI：音频已生成，即将播放
-            if self._on_sentence_start:
-                try:
-                    self._on_sentence_start(self._current_index, sentence)
-                except Exception:
-                    pass
-
             # 用 MCI 播放
             self._mci_open(mci, alias, temp_file)
             self._mci_send(mci, f"play {alias}")
+
+            # 等音频真正开始播放后再通知 UI，避免高亮提前于语音
+            self._mci_wait_playing(mci, alias, timeout=1.0)
+            if not self._stop_flag.is_set() and self._skip_to_index is None:
+                self._notify_sentence_start(self._current_index, sentence)
 
             # 轮询播放状态
             self._poll_edge_playback(mci, alias)
@@ -677,6 +754,19 @@ class TTSEngine:
                 break
 
             time.sleep(0.05)
+
+    def _mci_wait_playing(self, mci, alias: str, timeout: float = 1.0) -> bool:
+        """等待 MCI 设备进入 playing 状态（音频真正出声）。"""
+        status_buf = ctypes.create_unicode_buffer(256)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._stop_flag.is_set() or self._skip_to_index is not None:
+                return False
+            self._mci_send(mci, f"status {alias} mode", status_buf)
+            if status_buf.value.lower() == "playing":
+                return True
+            time.sleep(0.02)
+        return False
 
     # ------------------------------------------------------------------
     # MCI 工具方法
