@@ -67,6 +67,12 @@ class TTSEngine:
     # MCI 别名（用于 Edge-TTS 播放）
     _MCI_ALIAS = "pdf_voice_reader"
 
+    # 句间额外停顿（毫秒）。当前仅作为统一配置常量保留；
+    # SAPI5 的句间停顿由语音包自身特性决定，pyttsx3 没有提供精确调整接口；
+    # Edge-TTS 由于每次只合成一个句子，句间延迟主要来自网络生成时间，
+    # 已通过预生成下一句音频来压缩空档。
+    INTER_SENTENCE_PAUSE_MS = 0
+
     def __init__(self, voice_manager: Optional[VoiceManager] = None):
         self._voice_manager = voice_manager or VoiceManager()
         self._voices: list[VoiceInfo] = self._voice_manager.voices
@@ -110,6 +116,14 @@ class TTSEngine:
         # 当前播放使用的后端和语音
         self._current_provider: str = "sapi5"
         self._current_edge_short_name: str = ""
+
+        # Edge-TTS 当前生效的参数（worker 启动时计算，预生成线程也会读取）
+        self._edge_rate: int = 0
+        self._edge_volume_pct: int = 0
+
+        # Edge-TTS 预生成音频缓存：index -> temp_file_path
+        self._edge_prefetch: dict[int, str] = {}
+        self._edge_prefetch_lock = threading.Lock()
 
         # SAPI5 引擎实例（仅在 worker 线程中使用）
         self._sapi5_engine: Optional[pyttsx3.Engine] = None
@@ -192,6 +206,12 @@ class TTSEngine:
                 self._sapi5_engine.setProperty("rate", rate)
             except Exception:
                 pass
+        # Edge-TTS 的 rate 在 worker 循环和预生成线程中读取；
+        # 清空预生成缓存，避免旧 rate 的音频被继续使用
+        if self._current_provider == "edge":
+            self._edge_rate = int((self._rate - 200) / 2)
+            self._edge_rate = max(-100, min(100, self._edge_rate))
+            self._clear_edge_prefetch()
 
     def set_volume(self, volume: float):
         self._volume = max(0.0, min(1.0, volume))
@@ -200,6 +220,10 @@ class TTSEngine:
                 self._sapi5_engine.setProperty("volume", self._volume)
             except Exception:
                 pass
+        if self._current_provider == "edge":
+            self._edge_volume_pct = int((self._volume - 1.0) * 100)
+            self._edge_volume_pct = max(-100, min(100, self._edge_volume_pct))
+            self._clear_edge_prefetch()
 
     # ------------------------------------------------------------------
     # 文本处理
@@ -396,6 +420,9 @@ class TTSEngine:
 
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3.0)
+
+        # 停止后清理 Edge-TTS 预生成缓存，避免残留临时文件
+        self._clear_edge_prefetch()
 
         self._set_state(ReaderState.IDLE)
 
@@ -701,26 +728,30 @@ class TTSEngine:
     # ------------------------------------------------------------------
 
     def _run_edge_worker(self):
-        """Edge-TTS 后端工作循环。"""
+        """Edge-TTS 后端工作循环（带预生成优化，减少句间网络延迟）。"""
         mci = ctypes.windll.winmm
         alias = self._MCI_ALIAS
 
-        # Edge-TTS 参数转换
-        edge_rate = int((self._rate - 200) / 2)  # 200 -> 0, 400 -> 100, 50 -> -75
-        edge_rate = max(-100, min(100, edge_rate))
+        # Edge-TTS 参数转换（写入成员变量，供预生成线程读取）
+        self._edge_rate = int((self._rate - 200) / 2)  # 200 -> 0, 400 -> 100, 50 -> -75
+        self._edge_rate = max(-100, min(100, self._edge_rate))
         # Edge-TTS volume 是相对百分比：1.0 -> "+0%", 0.5 -> "-50%", 0.0 -> "-100%"
-        edge_volume_pct = int((self._volume - 1.0) * 100)
-        edge_volume_pct = max(-100, min(100, edge_volume_pct))
+        self._edge_volume_pct = int((self._volume - 1.0) * 100)
+        self._edge_volume_pct = max(-100, min(100, self._edge_volume_pct))
+
+        # 清空历史缓存，避免播放新文档时误用过期音频
+        self._clear_edge_prefetch()
 
         while self._current_index < len(self._sentences):
             if self._stop_flag.is_set():
                 break
 
-            # 处理 skip 信号
+            # 处理 skip 信号：跳转目标句之前的预生成缓存全部失效
             if self._skip_to_index is not None:
                 self._current_index = self._skip_to_index
                 self._skip_to_index = None
                 self._mci_stop(mci, alias)
+                self._clear_edge_prefetch()
                 continue
 
             self._pause_event.wait()
@@ -732,17 +763,28 @@ class TTSEngine:
                 self._current_index += 1
                 continue
 
-            # 生成音频（先生成，成功后再通知 UI）
-            temp_file = os.path.join(tempfile.gettempdir(), f"edge_tts_{threading.get_ident()}.mp3")
-            try:
-                self._generate_edge_audio(sentence, self._current_edge_short_name, temp_file, edge_rate, edge_volume_pct)
-            except Exception:
-                self._current_index += 1
-                continue
+            # 优先使用预生成的音频；没有命中则同步生成当前句
+            temp_file = self._get_prefetched_edge_audio(self._current_index)
+            if temp_file is None:
+                temp_file = os.path.join(tempfile.gettempdir(), f"edge_tts_{threading.get_ident()}_{self._current_index}.mp3")
+                try:
+                    self._generate_edge_audio(sentence, self._current_edge_short_name, temp_file, self._edge_rate, self._edge_volume_pct)
+                except Exception:
+                    self._current_index += 1
+                    continue
 
             if self._stop_flag.is_set():
                 self._cleanup_temp(temp_file)
                 break
+
+            # 当前句播放的同时，后台预生成下一句，压缩句间网络等待
+            next_idx = self._current_index + 1
+            if next_idx < len(self._sentences):
+                threading.Thread(
+                    target=self._prefetch_edge_audio,
+                    args=(next_idx,),
+                    daemon=True,
+                ).start()
 
             # 用 MCI 播放
             self._mci_open(mci, alias, temp_file)
@@ -764,12 +806,17 @@ class TTSEngine:
             if self._skip_to_index is not None:
                 self._current_index = self._skip_to_index
                 self._skip_to_index = None
+                # 跳转后预生成缓存失效
+                self._clear_edge_prefetch()
                 continue
 
             if self._stop_flag.is_set():
                 break
 
             self._current_index += 1
+
+        # 退出时清理预生成缓存
+        self._clear_edge_prefetch()
 
         # 朗读完成回调
         if not self._stop_flag.is_set() and self._current_index >= len(self._sentences):
@@ -789,6 +836,55 @@ class TTSEngine:
             volume=f"{volume_pct:+d}%",
         )
         asyncio.run(communicate.save(output_path))
+
+    def _prefetch_edge_audio(self, index: int):
+        """后台预生成指定句子的 Edge-TTS 音频，减少句间网络延迟。"""
+        if not (0 <= index < len(self._sentences)) or not self._current_edge_short_name:
+            return
+
+        with self._edge_prefetch_lock:
+            if index in self._edge_prefetch:
+                return
+            # 先占位，避免多个线程重复生成同一句
+            self._edge_prefetch[index] = ""
+
+        temp_file = os.path.join(tempfile.gettempdir(), f"edge_tts_prefetch_{threading.get_ident()}_{index}.mp3")
+        try:
+            self._generate_edge_audio(
+                self._sentences[index],
+                self._current_edge_short_name,
+                temp_file,
+                self._edge_rate,
+                self._edge_volume_pct,
+            )
+        except Exception:
+            with self._edge_prefetch_lock:
+                self._edge_prefetch.pop(index, None)
+            self._cleanup_temp(temp_file)
+            return
+
+        with self._edge_prefetch_lock:
+            if self._stop_flag.is_set():
+                self._cleanup_temp(temp_file)
+                self._edge_prefetch.pop(index, None)
+            else:
+                self._edge_prefetch[index] = temp_file
+
+    def _get_prefetched_edge_audio(self, index: int) -> Optional[str]:
+        """获取并移除指定句子的预生成音频路径。"""
+        with self._edge_prefetch_lock:
+            path = self._edge_prefetch.pop(index, None)
+            if path and os.path.exists(path):
+                return path
+            return None
+
+    def _clear_edge_prefetch(self):
+        """清理所有预生成音频文件与缓存。"""
+        with self._edge_prefetch_lock:
+            for path in self._edge_prefetch.values():
+                if path:
+                    self._cleanup_temp(path)
+            self._edge_prefetch.clear()
 
     def _poll_edge_playback(self, mci, alias: str):
         """轮询 Edge-TTS 播放状态，处理暂停/恢复/停止/跳转。"""
