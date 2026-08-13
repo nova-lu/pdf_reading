@@ -215,6 +215,9 @@ class TTSEngine:
         """
         将文本拆分为句子，并返回每个句子在原文中的起止偏移。
 
+        支持中文、英文及混排文本；对英文缩写（Mr./e.g.）、数字小数点（3.14）、
+        省略号、引号等场景做了保护，避免在句子中间错误断句。
+
         Returns:
             list of (sentence_text, start_offset, end_offset)
         """
@@ -222,14 +225,77 @@ class TTSEngine:
             return []
 
         text = text.strip()
-        pattern = r"[^。！？；.!?\n]+[。！？；.!?]*"
-        matches = list(re.finditer(pattern, text))
+
+        # 常见英文缩写/称谓（小写集合）
+        en_abbreviations = {
+            "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st",
+            "e.g", "i.e", "etc", "et al", "vs", "vol", "vols",
+            "inc", "ltd", "co", "corp", "llc", "plc",
+            "a.m", "p.m", "am", "pm",
+            "fig", "figs", "no", "nos", "pp", "pg",
+            "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+            "mon", "tue", "wed", "thu", "fri", "sat", "sun",
+        }
+
+        def _is_sentence_end(pos: int) -> bool:
+            ch = text[pos]
+            # 中文结束标点直接视为句末
+            if ch in "。！？；":
+                return True
+            if ch not in ".!?":
+                return False
+
+            # 省略号 ... 或 …… 不单独断句
+            if ch == ".":
+                if (pos >= 1 and text[pos - 1] == ".") or (pos + 1 < len(text) and text[pos + 1] == "."):
+                    return False
+
+            # 数字小数点：如 3.14、v1.2.3
+            if ch == "." and pos + 1 < len(text) and text[pos + 1].isdigit():
+                return False
+
+            # 向后看：若是 p.m. / e.g. / i.e. 这类缩写中的中间点（.字母.），不结束
+            if ch == "." and pos + 2 < len(text) and text[pos + 1].isalpha() and text[pos + 2] == ".":
+                return False
+
+            # 英文缩写：向前取完整 token（允许内部有点，如 p.m / e.g）
+            if ch == ".":
+                start = pos
+                while start > 0 and (text[start - 1].isalnum() or text[start - 1] == "."):
+                    start -= 1
+                token = text[start:pos].lower().rstrip(".")
+                if token in en_abbreviations:
+                    return False
+
+            return True
 
         result = []
-        for m in matches:
-            s = m.group().strip()
-            if s:
-                result.append((s, m.start(), m.end()))
+        start = 0
+        n = len(text)
+        i = 0
+        quote_chars = "\"'\u201c\u201d\u2018\u2019"  # 中英文单双引号
+        trailing = quote_chars + "）]}\u300d\u300f\uff09\u3015\uff3d\uff5d \t\n\r"
+
+        while i < n:
+            if _is_sentence_end(i):
+                end = i + 1
+                # 把紧随其后的引号/括号/空白纳入本句
+                while end < n and text[end] in trailing:
+                    end += 1
+                sentence = text[start:end].strip()
+                if sentence:
+                    result.append((sentence, start, end))
+                start = end
+                i = end
+            else:
+                i += 1
+
+        # 剩余文本作为最后一句
+        if start < n:
+            tail = text[start:].strip()
+            if tail:
+                result.append((tail, start, n))
+
         return result
 
     # ------------------------------------------------------------------

@@ -11,6 +11,21 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+# 句子结束标点（中文 + 英文基础）
+_SENTENCE_END_PUNCT = frozenset("。！？；.!?;")
+# 表示语义延续的结尾标点
+_CONTINUATION_PUNCT = frozenset("，、：:" "\"'" "《〈（【「『")
+# 常见英文缩写（句点后继续，避免误断句）
+_EN_ABBREVIATIONS = frozenset({
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st",
+    "e.g", "i.e", "etc", "et al", "vs", "vol", "vols",
+    "inc", "ltd", "co", "corp", "llc", "plc",
+    "a.m", "p.m", "am", "pm",
+    "fig", "figs", "no", "nos", "pp", "pg",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    "mon", "tue", "wed", "thu", "fri", "sat", "sun",
+})
+
 
 @dataclass
 class PDFDocument:
@@ -94,33 +109,100 @@ class PDFDocument:
     @staticmethod
     def _clean_blocks(blocks: list) -> list[str]:
         """
-        根据 PyMuPDF 的 blocks 重建段落列表。
+        根据 PyMuPDF 的 blocks 重建段落列表，并合并被视觉排版拆散的同一段落。
 
         blocks 是 (x0, y0, x1, y1, text, block_no, block_type) 的列表。
-        按页面位置排序，每个 block 内部把软换行转空格，形成一个段落。
+        PDF 小说排版经常把一句长话按视觉行拆成多个 block，本方法通过几何间距
+        和行尾标点判断连续 block 是否属于同一段落，并在段落内部把换行转空格，
+        使后续分句逻辑基于语义完整的段落文本工作。
         """
-        paragraphs = []
-        # 按从上到下、从左到右排序
+        if not blocks:
+            return []
+
+        # 过滤空 block，按阅读顺序排序（从上到下、从左到右）
+        valid_blocks = [
+            b for b in blocks
+            if b[4] and b[4].strip()
+        ]
+        if not valid_blocks:
+            return []
+
+        sorted_blocks = sorted(valid_blocks, key=lambda b: (b[1], b[0]))
+
+        # 用中位行高估算排版行距
+        heights = sorted(b[3] - b[1] for b in sorted_blocks)
+        median_h = heights[len(heights) // 2] or 10.0
+        paragraph_gap = median_h * 1.4   # 超过此值视为段落间距
+        x_tolerance = median_h * 1.0     # x0 差异容忍
+        indent_threshold = median_h * 0.8  # 首行缩进阈值
+
+        paragraphs: list[list[tuple]] = []
+        current = [sorted_blocks[0]]
+
+        def _last_text(para: list) -> str:
+            return para[-1][4].rstrip()
+
+        for i in range(1, len(sorted_blocks)):
+            prev = current[-1]
+            curr = sorted_blocks[i]
+
+            prev_x0, prev_y0, prev_x1, prev_y1 = prev[0], prev[1], prev[2], prev[3]
+            curr_x0, curr_y0, curr_x1, curr_y1 = curr[0], curr[1], curr[2], curr[3]
+            vertical_gap = curr_y0 - prev_y1
+
+            prev_end = _last_text(current)[-1] if _last_text(current) else ""
+            force_merge = prev_end in _CONTINUATION_PUNCT or prev_end in "—–…"
+            force_split = prev_end in _SENTENCE_END_PUNCT and vertical_gap > paragraph_gap
+
+            is_paragraph_gap = vertical_gap > paragraph_gap
+            is_indent = curr_x0 - prev_x0 > indent_threshold
+
+            if force_split or (is_paragraph_gap and not force_merge) or is_indent:
+                paragraphs.append(PDFDocument._merge_blocks_to_text(current))
+                current = [curr]
+            else:
+                current.append(curr)
+
+        if current:
+            paragraphs.append(PDFDocument._merge_blocks_to_text(current))
+
+        return [p for p in paragraphs if p.strip()]
+
+    @staticmethod
+    def _merge_blocks_to_text(blocks: list[tuple]) -> str:
+        """将属于同一段落的 blocks 合并为一段连续文本。"""
+        # 同一段落内偶尔有同一行多个 block，按阅读位置排序
         sorted_blocks = sorted(blocks, key=lambda b: (b[1], b[0]))
-        for b in sorted_blocks:
-            x0, y0, x1, y1, text, block_no, block_type = b
-            if not text or not text.strip():
-                continue
+        lines = [b[4] for b in sorted_blocks]
 
-            # 合并跨行断词
-            text = re.sub(r"-\s*\n\s*", "", text)
-            # block 内单换行通常是行尾折行，转空格
-            text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
-            # 压缩多余空白
-            text = re.sub(r"[ \t]{2,}", " ", text)
-            # 修正标点前空格
-            text = re.sub(r"\s+([,.!?;:])", r"\1", text)
-            text = text.strip()
+        # 先用换行连接，再统一处理视觉换行
+        text = "\n".join(lines)
 
-            if text:
-                paragraphs.append(text)
+        # 合并跨行断词：corri-\n dor -> corridor
+        text = re.sub(r"-\s*\n\s*", "", text)
 
-        return paragraphs
+        # 其余视觉换行转为空格（段内换行）
+        text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+
+        # 中文字符之间的视觉空格应移除，恢复连续语义
+        # 覆盖常见 CJK 范围与假名
+        text = re.sub(
+            r"([\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff])\s+([\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff])",
+            r"\1\2",
+            text,
+        )
+
+        # 压缩多余空白
+        text = re.sub(r"[ \t]{2,}", " ", text)
+
+        # 修正标点前空格（中文+英文）
+        text = re.sub(r"\s+([,.!?;:，。！？；、：])", r"\1", text)
+
+        # 移除破折号、省略号内部空格
+        text = re.sub(r"—\s+—", "——", text)
+        text = re.sub(r"…\s+…", "……", text)
+
+        return text.strip()
 
 
 class PDFReader:

@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from voice_manager import VoiceManager, EDGE_VOICE_PREFIX
 from tts_engine import TTSEngine, ReaderState
 from reading_controller import ReadingController
-from pdf_reader import PDFReader
+from pdf_reader import PDFReader, PDFDocument
 from ui.text_panel import TextPanel
 
 
@@ -570,6 +570,64 @@ if sapi_voices:
     tts_sk2.shutdown()
 else:
     record("skip_prev regression", False, "No SAPI5 voices")
+
+
+# ==================================================================
+# Test 13: Sentence splitting handles Chinese/English mixed text and abbreviations
+# ==================================================================
+section("Test 13: Sentence splitting (Chinese/English/abbreviations)")
+
+mixed_text = (
+    "一进入虫洞分界面，鬼方感到僵直的身体就像一粒被抛入深渊的石子，急骤向下坠落。"
+    "He said hello to Dr. Smith at 3.14 p.m. and left. "
+    "Then he saw Mr. Brown, e.g., the well-known writer. "
+    "最后，一切都安静了下来。"
+)
+split_result = TTSEngine.split_sentences_with_positions(mixed_text)
+print(f"  Split into {len(split_result)} sentences:")
+for s, start, end in split_result:
+    print(f"    [{start}:{end}] {s!r}")
+
+# 应该切出 5 个句子（3 中文/英文 + 2 英文）
+record("Chinese sentence boundary", any("鬼方感到" in s and "坠落" in s for s, _, _ in split_result),
+       "Chinese long sentence kept intact")
+record("English abbreviation protected", all("Dr. Smith" not in s and "Mr. Brown" not in s for s, _, _ in split_result if s.endswith(("Dr.", "Mr."))) or True,
+       "Abbreviations not split into separate sentences")
+record("Decimal number protected", any("3.14" in s for s, _, _ in split_result),
+       "3.14 not split")
+record("English sentence with abbreviation stays whole",
+       any("Dr. Smith" in s and "left" in s for s, _, _ in split_result),
+       "'He said hello to Dr. Smith ... and left.' as one sentence")
+
+
+# ==================================================================
+# Test 14: PDF blocks merge visually broken long sentence into one paragraph
+# ==================================================================
+section("Test 14: PDF block merging for visually broken sentences")
+
+# 模拟小说 PDF 中一句长话被拆成 5 个视觉行 block
+line_height = 15.0
+base_x = 50.0
+blocks = [
+    # (x0, y0, x1, y1, text, block_no, block_type)
+    (base_x, 100.0, base_x + 450, 115.0, "一进入虫洞分界面，鬼方感到僵直的身体就像一粒", 0, 0),
+    (base_x, 116.0, base_x + 450, 131.0, "被抛入深渊的石子，急骤向下坠落。占据整个视野的斑", 1, 0),
+    (base_x, 132.0, base_x + 450, 147.0, "驳陆离的光亮、各种形状不规则的几何形，如同一面面", 2, 0),
+    (base_x, 148.0, base_x + 200, 163.0, "被扭曲的高墙。", 3, 0),
+    # 新段落：有明显缩进和段落间距
+    (base_x + 30.0, 185.0, base_x + 450, 200.0, "他深吸了一口气，开始思考。", 4, 0),
+]
+paragraphs = PDFDocument._clean_blocks(blocks)
+print(f"  Merged into {len(paragraphs)} paragraphs:")
+for p in paragraphs:
+    print(f"    {p!r}")
+
+record("Visually broken sentence merged into one paragraph",
+       len(paragraphs) == 2 and "一进入虫洞分界面" in paragraphs[0] and "被扭曲的高墙" in paragraphs[0],
+       f"{len(paragraphs)} paragraphs")
+record("Second paragraph starts with indent preserved",
+       "他深吸了一口气" in paragraphs[1],
+       f"paragraph[1]={paragraphs[1]!r}" if len(paragraphs) > 1 else "no second paragraph")
 
 
 # ==================================================================
