@@ -4,28 +4,29 @@ Windows 桌面端 PDF 语音朗读应用，支持打开 PDF 文档并使用 TTS 
 
 ## 功能特性
 
-- **PDF 文档解析**：基于 PyMuPDF，支持普通 PDF 和加密 PDF（自动尝试空密码）
-- **语音朗读**：使用 Windows SAPI5 语音引擎，逐句朗读，支持中英文
-- **播放控制**：播放 / 暂停 / 恢复 / 停止，上一句 / 下一句跳转
-- **多语音切换**：自动检测系统已安装的语音包（中文、英文等）
+- **PDF 文档解析**：基于 PyMuPDF，支持普通 PDF 和加密 PDF（自动尝试空密码），按段落保留排版
+- **双引擎语音朗读**：SAPI5 本地语音 + Edge-TTS 在线神经语音（共 9 个语音可选）
+- **播放控制**：播放 / 暂停 / 恢复 / 停止，上一句 / 下一句跳转，进度条拖拽跳转
+- **高亮同步**：当前朗读句子黄色高亮，与音频严格同步（基于 SAPI5 `started-word` 事件 / Edge-TTS MCI 播放状态）
+- **朗读范围**：可选朗读全文或仅当前页，支持从任意页开始
+- **选中文本朗读**：选中文本后右键或点按钮即可朗读选中内容
+- **页面导航**：上一页 / 下一页 / 跳转指定页，跨页朗读自动翻页
 - **参数调节**：语速（50-400）、音量（0-100%）实时调节
-- **朗读范围**：可选择朗读全文或仅当前页
-- **进度显示**：实时高亮当前朗读句子，显示朗读进度
-- **页面导航**：上一页 / 下一页 / 跳转指定页
-- **快捷键**：Ctrl+O 打开文件、空格 播放/暂停、Esc 停止
+- **快捷键**：Ctrl+O 打开文件、空格 播放/暂停、Esc 停止、←/→ 上一句/下一句
 
 ## 技术栈
 
 | 组件 | 技术 | 说明 |
 |------|------|------|
-| PDF 解析 | PyMuPDF | 快速可靠的 PDF 文本提取 |
-| 语音合成 | pyttsx3 | Windows SAPI5 离线 TTS 引擎 |
+| PDF 解析 | PyMuPDF | 快速可靠的 PDF 文本提取，按 block 保留段落结构 |
+| 本地语音 | pyttsx3 + SAPI5 | Windows 系统自带，离线可用 |
+| 在线语音 | edge-tts | 微软 Edge 神经语音，音质更好 |
 | GUI 界面 | tkinter + ttk | Python 内置，无需额外安装 |
-| 线程模型 | threading | TTS 在独立线程运行，UI 不卡顿 |
+| 线程模型 | threading + queue | TTS 在 worker 线程运行，UI 通过队列更新 |
 
 ## 快速开始
 
-### 方式一：直接运行（推荐）
+### 方式一：直接运行（开发模式）
 
 1. 双击 `start.bat` 启动
 
@@ -42,44 +43,127 @@ venv\Scripts\pip.exe install -r requirements.txt
 venv\Scripts\python.exe main.py
 ```
 
+### 方式三：打包为 EXE（分发用）
+
+见下方 [打包说明](#打包为-exe)。
+
 ## 项目结构
 
 ```
 pdf_voice_reader/
-├── main.py           # 主程序入口 + GUI 界面
-├── pdf_reader.py     # PDF 文本提取模块
-├── tts_engine.py     # TTS 语音引擎模块（线程安全）
-├── requirements.txt  # Python 依赖
-├── start.bat         # Windows 启动脚本
-└── README.md         # 说明文档
+├── main.py                    # 主程序入口（薄入口）
+├── pdf_reader.py              # PDF 文本提取（blocks 段落识别）
+├── tts_engine.py              # TTS 引擎（双后端 SAPI5 + Edge-TTS）
+├── voice_manager.py           # 统一语音管理
+├── reading_controller.py      # 页面感知朗读控制
+├── ui/
+│   ├── __init__.py
+│   ├── main_window.py         # 主窗口编排
+│   ├── text_panel.py          # 文本预览面板（段落排版 + 高亮 + 选择朗读）
+│   └── control_panel.py       # 控制面板（播放控制 + 可拖拽进度 + 语音设置）
+├── packaging/                  # 打包相关（与源码解耦）
+│   ├── build_exe.py           # 自动化打包脚本
+│   ├── pdf_reader.spec        # PyInstaller spec 配置（参考）
+│   └── requirements_build.txt # 打包专用依赖
+├── requirements.txt           # Python 运行时依赖
+├── start.bat                  # Windows 启动脚本
+├── e2e_test.py                # 端到端测试（21 项）
+├── .gitignore
+└── README.md
 ```
 
-## 界面说明
+## 打包为 EXE
+
+### 环境要求
+
+- **操作系统**：Windows 10 / 11（64 位）
+- **Python**：3.10+（推荐 3.13）
+- **虚拟环境**：已安装 `requirements.txt` 中的所有运行时依赖
+- **磁盘空间**：至少 500 MB（PyInstaller 缓存 + 输出文件）
+- **网络**：首次打包需要联网（PyInstaller 安装 + edge-tts 元数据）
+
+### 打包步骤
+
+```bash
+# 1. 确保在项目根目录，且 venv 已安装运行时依赖
+cd pdf_voice_reader
+venv\Scripts\pip.exe install -r requirements.txt
+
+# 2. 运行打包脚本（自动安装 PyInstaller，清理旧产物，执行打包）
+venv\Scripts\python.exe packaging\build_exe.py
+```
+
+打包完成后，exe 文件输出到：
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  文件  帮助                                               │
-├──────────────────────────────────────┬───────────────────┤
-│                                      │  语音设置          │
-│  PDF 文本预览                        │  语音引擎 [下拉]    │
-│  （可滚动，当前句高亮）               │  语速   [滑块]     │
-│                                      │  音量   [滑块]     │
-│                                      │                   │
-│                                      │  播放控制          │
-│                                      │  [▶ 播放]         │
-│                                      │  [■ 停止] [⏮] [⏭] │
-│                                      │                   │
-│                                      │  朗读进度          │
-│                                      │  第 3/15 句       │
-│                                      │  [====>      ]    │
-│                                      │                   │
-│                                      │  页面导航          │
-│                                      │  [◀] [▶] [跳转]   │
-│                                      │  ☑ 朗读全部页面    │
-├──────────────────────────────────────┴───────────────────┤
-│  状态：朗读中...                            共 3 个语音   │
-└──────────────────────────────────────────────────────────┘
+dist/PDF语音阅读助手.exe
 ```
+
+### 打包模式
+
+| 模式 | 命令 | 输出 | 适用场景 |
+|------|------|------|----------|
+| 单文件（默认） | `python packaging\build_exe.py` | `dist/PDF语音阅读助手.exe`（约 36 MB） | 分发方便，单文件即可运行 |
+| 目录模式 | `python packaging\build_exe.py --dir-mode` | `dist/PDF语音阅读助手/`（文件夹） | 启动更快，适合本地使用 |
+
+### 打包脚本参数
+
+```bash
+python packaging\build_exe.py [选项]
+
+选项：
+  --dir-mode     目录模式（onedir），启动更快但需要分发整个文件夹
+  --no-clean     跳过清理旧产物（增量打包，加速二次打包）
+  --output PATH  自定义输出目录（默认: dist/）
+  --clean        仅清理旧产物，不执行打包
+```
+
+### 打包配置说明
+
+打包配置与项目源码完全解耦，位于 `packaging/` 目录：
+
+- **`packaging/build_exe.py`**：自动化打包脚本，处理依赖检查、清理、打包、验证全流程
+- **`packaging/pdf_reader.spec`**：PyInstaller spec 配置文件（参考用，命令行模式自动生成 spec）
+- **`packaging/requirements_build.txt`**：打包专用依赖（PyInstaller）
+
+打包流程不影响版本迭代与开发：
+- `packaging/` 目录独立于源码模块
+- `.gitignore` 已排除 `dist/`、`packaging/_pyinstaller_cache/`、自动生成的 `.spec` 文件
+- 开发时无需安装 PyInstaller
+
+### 常见问题排查
+
+**Q: 打包时报 `ModuleNotFoundError: No module named 'xxx'`？**
+
+A: 在 `packaging/build_exe.py` 的 `--hidden-import` 列表中添加缺失的模块名，重新打包。
+
+**Q: 打包后的 exe 启动后闪退？**
+
+A: 用控制台模式重新打包来查看错误信息：
+```bash
+# 临时修改 build_exe.py 中的 --windowed 为 --console，或手动运行：
+venv\Scripts\python.exe -m PyInstaller main.py --name PDF语音阅读助手 --onefile --collect-all edge_tts --collect-all pyttsx3 --collect-all pymupdf --collect-all aiohttp --hidden-import pythoncom --hidden-import win32com
+```
+
+**Q: exe 文件太大（> 50 MB）？**
+
+A: 这是正常的。PyMuPDF（PDF 解析）和 aiohttp（Edge-TTS 网络库）体积较大。如需减小体积：
+- 使用 `--exclude-module` 排除不需要的模块
+- 使用 UPX 压缩（`--upx-dir` 指定 UPX 路径）
+
+**Q: 杀毒软件误报？**
+
+A: PyInstaller 打包的 exe 常被误报。解决方法：
+- 将 exe 添加到杀毒软件信任列表
+- 使用代码签名证书对 exe 进行签名
+
+**Q: Edge-TTS 在线语音无法使用？**
+
+A: Edge-TTS 需要网络连接。确认目标机器能访问 `speech.platform.bing.com`。如无需在线语音，可仅使用 SAPI5 本地语音。
+
+**Q: 打包后 SAPI5 语音不工作？**
+
+A: 确保 `pythoncom` 和 `pywintypes` 已包含在 hidden imports 中（`build_exe.py` 已默认配置）。如仍有问题，尝试在 spec 文件中添加 `--collect-all pywin32`。
 
 ## 安装更多语音
 
@@ -93,10 +177,17 @@ pdf_voice_reader/
 ## 常见问题
 
 **Q: 打开 PDF 后文本区域为空？**
+
 A: 该 PDF 可能是扫描件或纯图片，不包含可选文本。需要先用 OCR 工具处理。
 
 **Q: 没有检测到中文语音？**
+
 A: 请在 Windows 设置中安装中文语言包和语音包。
 
 **Q: 朗读时有卡顿？**
-A: 尝试降低语速，或关闭其他占用 CPU 的程序。
+
+A: 尝试降低语速，或关闭其他占用 CPU 的程序。在线语音（Edge-TTS）如遇网络延迟也会卡顿，可切换到本地语音。
+
+**Q: 高亮和语音不同步？**
+
+A: 已通过 SAPI5 `started-word` 事件（音频真正开始播放的时机）同步高亮，并在跳句/停止后排空引擎残留事件，确保导航与高亮、语音三者一致。如仍有问题，请确认使用的是最新版本。

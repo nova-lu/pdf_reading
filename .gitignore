@@ -36,3 +36,8 @@ temp_*.txt
 
 # Logs
 *.log
+
+# PyInstaller 打包输出
+dist/
+packaging/_pyinstaller_cache/
+/*.spec
