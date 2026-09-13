@@ -157,6 +157,9 @@ def run_pyinstaller(python: str, output_dir: Path, build_cache: Path,
         "--hidden-import", "pywintypes",
         "--hidden-import", "win32com",
         "--hidden-import", "win32com.client",
+        # 本地模块（函数内延迟导入，显式声明避免漏打包）
+        "--hidden-import", "math_unicode",
+        "--hidden-import", "tts_normalizer",
         # 排除不需要的模块，减小体积
         "--exclude-module", "pytest",
         "--exclude-module", "unittest",

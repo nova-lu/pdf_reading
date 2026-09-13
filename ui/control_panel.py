@@ -23,13 +23,19 @@ class ControlPanel:
     COLOR_TEXT = "#1e293b"
     COLOR_TEXT_MUTED = "#64748b"
 
-    def __init__(self, parent):
+    def __init__(self, parent, width: int = 320):
         """
         Args:
             parent: 父容器 (ttk.Frame)
+            width:  面板固定宽度（像素），默认 320。设置后无论外部如何拉伸
+                    都保持该宽度，不会被左侧内容挤压。
         """
-        panel = ttk.Frame(parent, style="Panel.TFrame")
-        panel.grid(row=0, column=1, sticky="nsew")
+        self._panel_width = width
+        panel = ttk.Frame(parent, style="Panel.TFrame", width=width)
+        # sticky="ns"：高度跟随父容器拉伸，宽度由 grid_propagate + width 锁死
+        panel.grid(row=0, column=1, sticky="ns")
+        # 禁止 grid 根据内部子控件要求调整大小，保持面板宽度恒定
+        panel.grid_propagate(False)
 
         self._build_voice_section(panel)
         self._build_playback_section(panel)

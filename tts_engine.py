@@ -29,6 +29,7 @@ import asyncio
 import ctypes
 import tempfile
 from enum import Enum
+from functools import lru_cache
 from typing import Callable, Optional
 
 # 确保能导入同目录模块
@@ -41,6 +42,24 @@ try:
     _EDGE_TTS_AVAILABLE = True
 except ImportError:
     _EDGE_TTS_AVAILABLE = False
+
+# 朗读层文本规范化（符号 → 中文读法）。仅在"发声"时使用，
+# 不改写句子列表，因此 UI 显示与高亮偏移始终基于 PDF 原始字符。
+try:
+    from tts_normalizer import normalize_for_tts as _normalize_for_tts
+except ImportError:  # 允许在未部署朗读层时降级为原样朗读
+    _normalize_for_tts = None
+
+
+@lru_cache(maxsize=1024)
+def _speech_normalized(text: str) -> str:
+    """把待朗读文本转成语音友好表达（带缓存，异常时回退原文）。"""
+    if _normalize_for_tts is None or not text:
+        return text
+    try:
+        return _normalize_for_tts(text)
+    except Exception:
+        return text
 
 
 class ReaderState(Enum):
@@ -113,6 +132,12 @@ class TTSEngine:
         self._rate: int = 200
         self._volume: float = 1.0
 
+        # 朗读层文本规范化开关：
+        # True  = 发声前把符号/上下标转成中文读法（如 x² → x的平方）
+        # False = 逐字原样朗读（严格保留 α、∑、² 等 Unicode 字符）
+        # 注意：只影响发声，句子列表与 UI 显示/高亮始终是保真文本。
+        self._speech_normalize: bool = True
+
         # 当前播放使用的后端和语音
         self._current_provider: str = "sapi5"
         self._current_edge_short_name: str = ""
@@ -176,6 +201,29 @@ class TTSEngine:
     @property
     def voice_id(self) -> Optional[str]:
         return self._voice_id
+
+    @property
+    def speech_normalize(self) -> bool:
+        """是否在发声前做朗读规范化（符号 → 中文读法）。"""
+        return self._speech_normalize
+
+    def set_speech_normalize(self, enabled: bool):
+        """
+        开关朗读规范化。
+
+        - True（默认）：符号、希腊字母、上下标等转为中文读法后朗读，
+          例如 "x² + y² = r²" 读作 "x的平方 加 y的平方 等于 r的平方"。
+        - False：严格按 PDF 原始字符朗读，不做任何改写。
+
+        该开关只影响 TTS 发声内容，不影响 PDF 提取结果、界面显示与高亮定位。
+        """
+        self._speech_normalize = bool(enabled)
+
+    def _speech_text(self, sentence: str) -> str:
+        """返回实际送去合成的文本（可能已做朗读规范化）。"""
+        if not self._speech_normalize or not sentence:
+            return sentence
+        return _speech_normalized(sentence)
 
     # ------------------------------------------------------------------
     # 回调注册
@@ -629,8 +677,9 @@ class TTSEngine:
             self._word_seen = False
             self._pending_utterance_index = self._current_index
             try:
-                # say() 传入 name=句索引；音频真正开始的信号是 started-word
-                self._sapi5_engine.say(sentence, name=f"sent_{self._current_index}")
+                # say() 传入 name=句索引；音频真正开始的信号是 started-word。
+                # 送合成的是朗读层文本（可开关），句索引/高亮仍用保真原文。
+                self._sapi5_engine.say(self._speech_text(sentence), name=f"sent_{self._current_index}")
 
                 # 阶段 1：等待首个 word 事件（StartStream，音频真正开始输出）
                 # 事件回调中会通知 UI 高亮 + set _utterance_started
@@ -768,7 +817,7 @@ class TTSEngine:
             if temp_file is None:
                 temp_file = os.path.join(tempfile.gettempdir(), f"edge_tts_{threading.get_ident()}_{self._current_index}.mp3")
                 try:
-                    self._generate_edge_audio(sentence, self._current_edge_short_name, temp_file, self._edge_rate, self._edge_volume_pct)
+                    self._generate_edge_audio(self._speech_text(sentence), self._current_edge_short_name, temp_file, self._edge_rate, self._edge_volume_pct)
                 except Exception:
                     self._current_index += 1
                     continue
@@ -851,7 +900,7 @@ class TTSEngine:
         temp_file = os.path.join(tempfile.gettempdir(), f"edge_tts_prefetch_{threading.get_ident()}_{index}.mp3")
         try:
             self._generate_edge_audio(
-                self._sentences[index],
+                self._speech_text(self._sentences[index]),
                 self._current_edge_short_name,
                 temp_file,
                 self._edge_rate,

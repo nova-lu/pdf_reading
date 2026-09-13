@@ -4,7 +4,7 @@ Windows 桌面端 PDF 语音朗读应用，支持打开 PDF 文档并使用 TTS 
 
 ## 功能特性
 
-- **PDF 文档解析**：基于 PyMuPDF，支持普通 PDF 和加密 PDF（自动尝试空密码），按段落保留排版
+- **PDF 文档解析**：基于 PyMuPDF，支持普通 PDF 和加密 PDF（自动尝试空密码），按段落保留排版；**字符保真**——希腊字母、数学运算符、箭头、Unicode 分数、上下标等原样保留，不改写、不做 Unicode 归一化
 - **双引擎语音朗读**：SAPI5 本地语音 + Edge-TTS 在线神经语音（共 9 个语音可选）
 - **播放控制**：播放 / 暂停 / 恢复 / 停止，上一句 / 下一句跳转，进度条拖拽跳转
 - **高亮同步**：当前朗读句子黄色高亮，与音频严格同步（基于 SAPI5 `started-word` 事件 / Edge-TTS MCI 播放状态）
@@ -52,7 +52,9 @@ venv\Scripts\python.exe main.py
 ```
 pdf_voice_reader/
 ├── main.py                    # 主程序入口（薄入口）
-├── pdf_reader.py              # PDF 文本提取（blocks 段落识别）
+├── pdf_reader.py              # PDF 文本提取（字符保真 + span 级上下标标注）
+├── math_unicode.py            # Unicode 数学字符工具（上下标映射、区块识别、字符画像）
+├── tts_normalizer.py          # 朗读层规范化（符号 → 中文读法，仅发声时使用）
 ├── tts_engine.py              # TTS 引擎（双后端 SAPI5 + Edge-TTS）
 ├── voice_manager.py           # 统一语音管理
 ├── reading_controller.py      # 页面感知朗读控制
@@ -67,10 +69,31 @@ pdf_voice_reader/
 │   └── requirements_build.txt # 打包专用依赖
 ├── requirements.txt           # Python 运行时依赖
 ├── start.bat                  # Windows 启动脚本
+├── test_text_fidelity.py      # 字符保真度测试（65 项）
+├── test_tts_normalizer.py     # 朗读规范化测试（54 项）
 ├── e2e_test.py                # 端到端测试（21 项）
 ├── .gitignore
 └── README.md
 ```
+
+## 文本处理架构：提取保真 + 朗读转换分层
+
+提取与朗读是两层，互不影响，保证"看到的字符"与"读出的内容"各自最优：
+
+| 层 | 模块 | 职责 | 是否改写字符 |
+|---|---|---|---|
+| 提取层 | `pdf_reader.py` + `math_unicode.py` | 忠实还原 PDF 字符：希腊字母、数学运算符、箭头、Unicode 分数、上下标等原样保留；用字号/基线识别视觉上下标并标注为 `x²`（或 `x^{2}`） | 不改写，只做结构性空白整理 |
+| 朗读层 | `tts_normalizer.py`（由 `tts_engine` 在发声前调用） | 把符号转成中文读法：`x²`→“x的平方”、`∑ᵢ₌₁ⁿ`→“从i等于1到n求和”、`π`→“派”、`½`→“二分之一” | 只影响音频，不写回提取结果 |
+
+- **字符保真**：提取过程不调用 `unicodedata.normalize`（不做 NFKC），不做任何"符号 → 中文"替换，不删除内容字符。
+- **上下标结构化**：`PDFReader.load(path, script_mode=...)` 支持三种表示
+  - `"unicode"`（默认）：`x²`、`a₁`，无法映射时回退 `x^{2}`
+  - `"latex"`：统一 `x^{2}`、`a_{1}`
+  - `"plain"`：不标注，按视觉顺序平铺
+- **符号变体归一**（`normalize_script_signs=True`，默认开启）：PDF 字体常把负号渲染成各种破折号（如 `10⁻⁴³` 的负号被映射为 U+2012 FIGURE DASH）。开启后上标内会归一为负号，得到 `10⁻⁴³` / `10^{-43}`（合法 LaTeX）；设为 `False` 则严格保留原始码位（`10^{‒43}`）。**该归一仅作用于上下标标记内部，正文中的 – — 等排版字符始终原样保留。**
+- **朗读开关**：`tts_engine.set_speech_normalize(False)` 可改为逐字原样朗读（严格保留 α、∑、² 等 Unicode 字符）。
+- **手动转换**：`PDFDocument.get_page_text_for_speech(page)` 返回朗读文本；`get_page_text_clean(page)` 始终返回保真文本。
+- **字符校验**：`math_unicode.check_critical_chars(text)` / `char_profile(text)` 可按 Unicode 区块统计字符构成，用于核对提取是否丢字或被改写。
 
 ## 打包为 EXE
 

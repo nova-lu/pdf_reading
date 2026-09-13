@@ -43,6 +43,10 @@ class PDFVoiceReaderApp:
     WINDOW_WIDTH = 1100
     WINDOW_HEIGHT = 720
 
+    # 右侧控制面板固定宽度（像素）。左侧 TextPanel 占满剩余空间，
+    # 不受其内容宽度变化影响；当 PDF 内容超宽时通过自动放大窗口来适配。
+    CONTROL_PANEL_WIDTH = 320
+
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("PDF 语音阅读助手")
@@ -145,12 +149,16 @@ class PDFVoiceReaderApp:
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 0))
 
-        main_frame.columnconfigure(0, weight=7)
-        main_frame.columnconfigure(1, weight=3)
+        # 列配置：
+        # - 列 0 (TextPanel): weight=1 占满剩余空间；minsize=400 保证最小可读宽度。
+        # - 列 1 (ControlPanel): weight=0 固定宽度，不参与窗口伸缩分配。
+        # 这样 PDF 内容宽度变化时只会影响左侧显示区，右侧面板始终保持固定宽度。
+        main_frame.columnconfigure(0, weight=1, minsize=400)
+        main_frame.columnconfigure(1, weight=0)
         main_frame.rowconfigure(0, weight=1)
 
         self.text_panel = TextPanel(main_frame, styles={})
-        self.control_panel = ControlPanel(main_frame)
+        self.control_panel = ControlPanel(main_frame, width=self.CONTROL_PANEL_WIDTH)
 
         # 绑定回调
         self.control_panel.set_callbacks(
@@ -170,8 +178,13 @@ class PDFVoiceReaderApp:
             on_read_selection=self._on_read_selection,
         )
 
-        # 文本面板右键“朗读选中内容”
+        # 文本面板右键"朗读选中内容"
         self.text_panel.set_on_read_selection(self._on_read_selection_text)
+
+        # 当 TextPanel 内容宽度超过窗口可视区域时，自动放大窗口以适配，
+        # 避免压缩右侧固定面板。
+        self._auto_resize_enabled = True
+        self.text_panel.text_area.bind("<Configure>", self._on_text_area_configure, add="+")
 
     # ==================================================================
     # 状态栏
@@ -440,6 +453,58 @@ class PDFVoiceReaderApp:
 
     def _set_status(self, message: str):
         self.lbl_status.config(text=message)
+
+    def _on_text_area_configure(self, event):
+        """TextPanel 内容区域大小变化时检查是否需要扩大窗口。
+
+        当 TextPanel "请求宽度"（按内容/字号换行所需最小宽度）超过当前窗口
+        实际可视宽度时，自动扩大窗口总宽度以容纳内容，而不会压缩右侧固定面板。
+        """
+        if not getattr(self, "_auto_resize_enabled", False):
+            return
+
+        # 触发频率较高，延迟到 idle 后再测量，避免抖动
+        if getattr(self, "_auto_resize_pending", False):
+            return
+        self._auto_resize_pending = True
+        self.root.after_idle(self._perform_auto_resize)
+
+    def _perform_auto_resize(self):
+        """执行实际的窗口宽度调整。"""
+        self._auto_resize_pending = False
+        if not getattr(self, "_auto_resize_enabled", False):
+            return
+
+        try:
+            # TextPanel 区域请求的最小宽度（按字号/内容计算）
+            needed_text_width = self.text_panel.text_area.winfo_reqwidth()
+
+            # 加上 ScrolledText 内部 padding（padx=20）、段落 lmargin1/2=24
+            # 这里直接用 winfo_reqwidth 已经包含这些
+            # 加上 panel 自身边框/padding 不再重复计算
+
+            # 右侧固定面板 + 中间 padding(8) + main_frame 左右 padding(12*2)
+            reserved = self.CONTROL_PANEL_WIDTH + 8 + 24
+
+            # 当前窗口宽度
+            current_w = self.root.winfo_width()
+            current_h = self.root.winfo_height()
+
+            # 期望宽度 = 文本所需 + 保留宽度
+            desired_w = needed_text_width + reserved
+
+            # 仅当所需宽度大于当前窗口时才扩大（且超过一定阈值），避免抖动
+            if desired_w > current_w + 10:
+                # 限制最大宽度，避免无限扩大
+                max_w = 1920
+                new_w = min(desired_w, max_w)
+                # 保持窗口中心位置不变
+                x = self.root.winfo_x()
+                y = self.root.winfo_y()
+                self.root.geometry(f"{new_w}x{current_h}+{x}+{y}")
+        except (tk.TclError, AttributeError):
+            # 窗口未完全初始化时忽略
+            pass
 
     def _show_about(self):
         messagebox.showinfo(
