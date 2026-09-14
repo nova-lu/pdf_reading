@@ -182,7 +182,14 @@ A: PyInstaller 打包的 exe 常被误报。解决方法：
 
 **Q: Edge-TTS 在线语音无法使用？**
 
-A: Edge-TTS 需要网络连接。确认目标机器能访问 `speech.platform.bing.com`。如无需在线语音，可仅使用 SAPI5 本地语音。
+A: Edge-TTS 需要网络连接。确认目标机器能访问 `speech.platform.bing.com`。程序会自动读取标准代理环境变量 `HTTPS_PROXY` / `https_proxy`（也兼容 `ALL_PROXY` 和 `HTTP_PROXY`）。企业网络需要代理时，可在 PowerShell 中先临时验证：
+
+```powershell
+$env:https_proxy = "http://127.0.0.1:3128"
+venv\Scripts\python.exe main.py
+```
+
+确认可用后，可通过 `setx HTTPS_PROXY "http://127.0.0.1:3128"` 写入当前用户环境变量，重启应用后生效。代理地址应以本机或组织实际配置为准。如无需在线语音，可仅使用 SAPI5 本地语音。
 
 **Q: 打包后 SAPI5 语音不工作？**
 

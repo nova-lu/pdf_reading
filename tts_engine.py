@@ -62,6 +62,15 @@ def _speech_normalized(text: str) -> str:
         return text
 
 
+def _edge_proxy_from_env() -> Optional[str]:
+    """读取 Edge-TTS 使用的显式代理（aiohttp 默认不会读取代理环境变量）。"""
+    for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"):
+        proxy = os.environ.get(name, "").strip()
+        if proxy:
+            return proxy
+    return None
+
+
 class ReaderState(Enum):
     """朗读状态。"""
     IDLE = "idle"
@@ -883,8 +892,23 @@ class TTSEngine:
             voice_short_name,
             rate=f"{rate:+d}%",
             volume=f"{volume_pct:+d}%",
+            proxy=_edge_proxy_from_env(),
         )
-        asyncio.run(communicate.save(output_path))
+        if sys.platform == "win32":
+            # Python 3.13 的 Proactor 在代理主动断开连接后可能对已关闭的
+            # socket 再次 shutdown，导致合成成功后仍打印 WinError 10054。
+            # 局部使用 Selector，避免修改应用的全局事件循环策略。
+            loop = asyncio.SelectorEventLoop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(communicate.save(output_path))
+            finally:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.run_until_complete(loop.shutdown_default_executor())
+                asyncio.set_event_loop(None)
+                loop.close()
+        else:
+            asyncio.run(communicate.save(output_path))
 
     def _prefetch_edge_audio(self, index: int):
         """后台预生成指定句子的 Edge-TTS 音频，减少句间网络延迟。"""
