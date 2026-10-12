@@ -55,6 +55,7 @@ pdf_voice_reader/
 ├── pdf_reader.py              # PDF 文本提取（字符保真 + span 级上下标标注）
 ├── math_unicode.py            # Unicode 数学字符工具（上下标映射、区块识别、字符画像）
 ├── tts_normalizer.py          # 朗读层规范化（符号 → 中文读法，仅发声时使用）
+├── edge_tts_compat.py         # edge-tts 端点迁移兼容层（v1→v2 主机回退 + Date 解析修复）
 ├── tts_engine.py              # TTS 引擎（双后端 SAPI5 + Edge-TTS）
 ├── voice_manager.py           # 统一语音管理
 ├── reading_controller.py      # 页面感知朗读控制
@@ -69,9 +70,10 @@ pdf_voice_reader/
 │   └── requirements_build.txt # 打包专用依赖
 ├── requirements.txt           # Python 运行时依赖
 ├── start.bat                  # Windows 启动脚本
-├── test_text_fidelity.py      # 字符保真度测试（65 项）
-├── test_tts_normalizer.py     # 朗读规范化测试（54 项）
-├── e2e_test.py                # 端到端测试（21 项）
+├── test_text_fidelity.py      # 字符保真度测试（82 项）
+├── test_tts_normalizer.py     # 朗读规范化测试（58 项）
+├── test_edge_tts_compat.py    # edge-tts 兼容层回归测试（27 项，离线）
+├── e2e_test.py                # 端到端测试（多场景，会实际发声）
 ├── .gitignore
 └── README.md
 ```
@@ -182,7 +184,9 @@ A: PyInstaller 打包的 exe 常被误报。解决方法：
 
 **Q: Edge-TTS 在线语音无法使用？**
 
-A: Edge-TTS 需要网络连接。确认目标机器能访问 `speech.platform.bing.com`。如无需在线语音，可仅使用 SAPI5 本地语音。
+A: Edge-TTS 需要网络连接。微软自 2026 年 10 月起将 Edge TTS 后端从 `speech.platform.bing.com`（v1）迁移到 `api.msedgeservices.com`（v2）并按区域灰度，旧版 edge-tts（≤7.2.8，仓库停留在 2026-03）在多区域会被服务端拒绝（WebSocket 握手 403）。
+
+本项目已通过 `edge_tts_compat.py` 在内置修复：合成端点自动切换到 v2，v2 不可用时回退 v1，并对失败给出明确错误提示与「切换到本地 SAPI5 语音」的恢复入口。若在线语音仍失败，请检查网络；无需在线语音时可仅使用 SAPI5 本地语音。
 
 **Q: 打包后 SAPI5 语音不工作？**
 

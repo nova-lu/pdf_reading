@@ -36,8 +36,12 @@ from typing import Callable, Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from voice_manager import VoiceManager, VoiceInfo, EDGE_VOICE_PREFIX
 
-# 尝试导入 edge-tts（可选依赖）
+# 尝试导入 edge-tts（可选依赖）。
+# 注意：先导入 edge_tts_compat——它会在 import 时把合成端点切换到
+# api.msedgeservices.com（微软 2026-10 起的 v2 端点），旧版
+# speech.platform.bing.com 已在多区域对旧握手返回 403。
 try:
+    import edge_tts_compat  # noqa: F401  # import 时即应用端点补丁
     import edge_tts
     _EDGE_TTS_AVAILABLE = True
 except ImportError:
@@ -68,6 +72,16 @@ class ReaderState(Enum):
     PLAYING = "playing"
     PAUSED = "paused"
     STOPPED = "stopped"
+
+
+# Edge-TTS 连续合成失败达到阈值后的致命错误消息。
+# UI 层可据此常量识别「需要用户干预」的错误（弹窗提供本地语音回退），
+# 避免用魔法字符串匹配。
+EDGE_FATAL_ERROR_MESSAGE = (
+    "Edge-TTS 连续多次合成失败，已停止朗读。\n"
+    "可能原因：网络不通或微软在线语音服务暂不可用。\n"
+    "建议切换到本地 SAPI5 语音，或检查网络后重试。"
+)
 
 
 class TTSEngine:
@@ -157,6 +171,13 @@ class TTSEngine:
         self._on_sentence_start: Optional[Callable[[int, str], None]] = None
         self._on_state_change: Optional[Callable[[ReaderState], None]] = None
         self._on_finish: Optional[Callable[[], None]] = None
+        # 错误回调（引擎不可用 / 合成连续失败等）。消息为中文，可直接展示给用户。
+        self._on_error: Optional[Callable[[str], None]] = None
+
+        # Edge-TTS 连续合成失败计数（达到阈值后中止朗读，避免静默空跑）
+        self._edge_fail_streak = 0
+        # Edge-TTS 连续失败阈值：首失败即提示，达到阈值后停止朗读
+        self.EDGE_MAX_CONSECUTIVE_FAILURES = 3
 
         # 设置默认语音
         if self._voices:
@@ -234,10 +255,20 @@ class TTSEngine:
         on_sentence_start: Optional[Callable[[int, str], None]] = None,
         on_state_change: Optional[Callable[[ReaderState], None]] = None,
         on_finish: Optional[Callable[[], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
     ):
         self._on_sentence_start = on_sentence_start
         self._on_state_change = on_state_change
         self._on_finish = on_finish
+        self._on_error = on_error
+
+    def _notify_error(self, message: str):
+        """向 UI 上报一条错误消息（worker 线程调用，需保证回调线程安全）。"""
+        if self._on_error:
+            try:
+                self._on_error(message)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # 参数设置
@@ -425,6 +456,7 @@ class TTSEngine:
         self._skip_to_index = None
         self._utterance_started.clear()
         self._utterance_done.clear()
+        self._edge_fail_streak = 0
 
         self._set_state(ReaderState.PLAYING)
         self._spoken_index = self._current_index
@@ -599,7 +631,10 @@ class TTSEngine:
         pythoncom.CoInitialize()
         try:
             self._run_sapi5_loop()
-        except Exception:
+        except Exception as exc:
+            # 引擎初始化/运行失败必须让用户知道，不能静默回到 IDLE
+            # （否则表现为"点了播放没声音也没反应"）
+            self._notify_error(f"本地语音引擎（SAPI5）启动失败：{exc}")
             self._set_state(ReaderState.IDLE)
         finally:
             pythoncom.CoUninitialize()
@@ -818,9 +853,20 @@ class TTSEngine:
                 temp_file = os.path.join(tempfile.gettempdir(), f"edge_tts_{threading.get_ident()}_{self._current_index}.mp3")
                 try:
                     self._generate_edge_audio(self._speech_text(sentence), self._current_edge_short_name, temp_file, self._edge_rate, self._edge_volume_pct)
-                except Exception:
+                except Exception as exc:
+                    # 合成失败不再静默跳句：首失败即上报，连续失败达到阈值后
+                    # 中止朗读并提示切换本地语音，避免"看起来在读其实没声"。
+                    self._edge_fail_streak += 1
+                    if self._edge_fail_streak == 1:
+                        self._notify_error(f"Edge-TTS 合成失败：{exc}")
+                    elif self._edge_fail_streak >= self.EDGE_MAX_CONSECUTIVE_FAILURES:
+                        self._notify_error(EDGE_FATAL_ERROR_MESSAGE)
+                        self._set_state(ReaderState.IDLE)
+                        break
                     self._current_index += 1
                     continue
+            # 合成成功，重置连续失败计数
+            self._edge_fail_streak = 0
 
             if self._stop_flag.is_set():
                 self._cleanup_temp(temp_file)
@@ -877,14 +923,21 @@ class TTSEngine:
                     pass
 
     def _generate_edge_audio(self, text: str, voice_short_name: str, output_path: str, rate: int, volume_pct: int):
-        """使用 Edge-TTS 生成音频文件。"""
-        communicate = edge_tts.Communicate(
-            text,
-            voice_short_name,
-            rate=f"{rate:+d}%",
-            volume=f"{volume_pct:+d}%",
+        """使用 Edge-TTS 生成音频文件。
+
+        经 edge_tts_compat 兼容层执行：自动使用微软 v2 合成端点
+        （api.msedgeservices.com），v2 不可用时回退旧端点，
+        并附带 locale 无关的 Date 头解析修复。
+        """
+        if not _EDGE_TTS_AVAILABLE:
+            raise RuntimeError("edge-tts 库未安装，无法使用在线语音（请 pip install edge-tts）")
+        edge_tts_compat.synthesize_to_file(
+            text=text,
+            voice=voice_short_name,
+            output_path=output_path,
+            rate=rate,
+            volume_pct=volume_pct,
         )
-        asyncio.run(communicate.save(output_path))
 
     def _prefetch_edge_audio(self, index: int):
         """后台预生成指定句子的 Edge-TTS 音频，减少句间网络延迟。"""
