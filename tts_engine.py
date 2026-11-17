@@ -63,12 +63,29 @@ def _speech_normalized(text: str) -> str:
 
 
 def _edge_proxy_from_env() -> Optional[str]:
-    """读取 Edge-TTS 使用的显式代理（aiohttp 默认不会读取代理环境变量）。"""
+    """
+    确定 Edge-TTS 使用的代理（aiohttp 默认不会读取代理环境变量）。
+
+    探测顺序：
+    1. 显式代理环境变量（HTTPS_PROXY / https_proxy / ALL_PROXY / HTTP_PROXY / http_proxy）
+    2. 本机 PX 代理（其中的 XX Local Proxy Manager，监听 127.0.0.1:3128）。
+       在其内网，DNS 无法解析 speech.platform.bing.com，必须走 PX 代理；
+       只要 PX 已在运行就自动采用，无需用户配置环境变量。
+
+    返回 None 表示直连（家庭/普通网络环境）。
+    """
     for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"):
         proxy = os.environ.get(name, "").strip()
         if proxy:
             return proxy
-    return None
+
+    # 探测本机 PX 代理（快速 TCP 连接测试，约几十毫秒）
+    try:
+        import socket
+        with socket.create_connection(("127.0.0.1", 3128), timeout=0.3):
+            return "http://127.0.0.1:3128"
+    except OSError:
+        return None
 
 
 class ReaderState(Enum):

@@ -1,4 +1,4 @@
 PyMuPDF>=1.23.0
 pyttsx3>=2.90
 pywin32>=306
-edge-tts>=7.0.0
+edge-tts>=7.3.1  # 7.3.1+: Sec-MS-GEC v2 令牌（微软 2026-10 起拒绝 v1，旧版全 403）
