@@ -51,12 +51,14 @@ class ReadingController:
         self._on_sentence_highlight: Optional[Callable[[int, int, str], None]] = None
         self._on_state_change: Optional[Callable[[ReaderState], None]] = None
         self._on_finish: Optional[Callable[[], None]] = None
+        self._on_error: Optional[Callable[[str], None]] = None
 
         # 注册 TTS 回调
         self.tts.set_callbacks(
             on_sentence_start=self._on_tts_sentence_start,
             on_state_change=self._on_tts_state_change,
             on_finish=self._on_tts_finish,
+            on_error=self._on_tts_error,
         )
 
     # ------------------------------------------------------------------
@@ -69,6 +71,7 @@ class ReadingController:
         on_sentence_highlight: Optional[Callable[[int, int, str], None]] = None,
         on_state_change: Optional[Callable[[ReaderState], None]] = None,
         on_finish: Optional[Callable[[], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
     ):
         """
         注册 UI 回调。
@@ -78,11 +81,13 @@ class ReadingController:
             on_sentence_highlight: 高亮回调，参数为 (sentence_index, page_num, sentence_text, start_offset, end_offset)
             on_state_change: 状态变化回调
             on_finish: 朗读完成回调
+            on_error: 错误回调，参数为中文错误消息（引擎不可用 / 合成连续失败等）
         """
         self._on_page_change = on_page_change
         self._on_sentence_highlight = on_sentence_highlight
         self._on_state_change = on_state_change
         self._on_finish = on_finish
+        self._on_error = on_error
 
     # ------------------------------------------------------------------
     # 文档管理
@@ -320,5 +325,13 @@ class ReadingController:
         if self._on_finish:
             try:
                 self._on_finish()
+            except Exception:
+                pass
+
+    def _on_tts_error(self, message: str):
+        """TTS 错误回调（在 worker 线程中被调用）。"""
+        if self._on_error:
+            try:
+                self._on_error(message)
             except Exception:
                 pass

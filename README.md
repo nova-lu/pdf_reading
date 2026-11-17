@@ -55,6 +55,7 @@ pdf_voice_reader/
 ├── pdf_reader.py              # PDF 文本提取（字符保真 + span 级上下标标注）
 ├── math_unicode.py            # Unicode 数学字符工具（上下标映射、区块识别、字符画像）
 ├── tts_normalizer.py          # 朗读层规范化（符号 → 中文读法，仅发声时使用）
+├── edge_tts_compat.py         # edge-tts 端点迁移兼容层（v1→v2 主机回退 + Date 解析修复）
 ├── tts_engine.py              # TTS 引擎（双后端 SAPI5 + Edge-TTS）
 ├── voice_manager.py           # 统一语音管理
 ├── reading_controller.py      # 页面感知朗读控制
@@ -69,9 +70,10 @@ pdf_voice_reader/
 │   └── requirements_build.txt # 打包专用依赖
 ├── requirements.txt           # Python 运行时依赖
 ├── start.bat                  # Windows 启动脚本
-├── test_text_fidelity.py      # 字符保真度测试（65 项）
-├── test_tts_normalizer.py     # 朗读规范化测试（54 项）
-├── e2e_test.py                # 端到端测试（21 项）
+├── test_text_fidelity.py      # 字符保真度测试（82 项）
+├── test_tts_normalizer.py     # 朗读规范化测试（58 项）
+├── test_edge_tts_compat.py    # edge-tts 兼容层回归测试（27 项，离线）
+├── e2e_test.py                # 端到端测试（多场景，会实际发声）
 ├── .gitignore
 └── README.md
 ```
@@ -182,14 +184,18 @@ A: PyInstaller 打包的 exe 常被误报。解决方法：
 
 **Q: Edge-TTS 在线语音无法使用？**
 
-A: Edge-TTS 需要网络连接。确认目标机器能访问 `speech.platform.bing.com`。程序会自动读取标准代理环境变量 `HTTPS_PROXY` / `https_proxy`（也兼容 `ALL_PROXY` 和 `HTTP_PROXY`）。企业网络需要代理时，可在 PowerShell 中先临时验证：
+A: 通常有两类原因，本项目均已内置修复：
+
+1. **端点迁移（2026-10 起）**：微软将 Edge TTS 后端从 `speech.platform.bing.com`（v1）迁移到 `api.msedgeservices.com`（v2）并按区域灰度，旧版 edge-tts（≤7.2.8）在多区域会被服务端拒绝（WebSocket 握手 403）。`edge_tts_compat.py` 已在运行时把合成端点自动切换到 v2，v2 不可用时回退 v1；依赖请使用 `edge-tts>=7.3.1`。
+2. **网络/代理**：确认目标机器能访问微软语音服务。程序会自动读取标准代理环境变量 `HTTPS_PROXY` / `https_proxy`（也兼容 `ALL_PROXY` 和 `HTTP_PROXY`）；未设置环境变量时，若检测到本机 PX 代理（127.0.0.1:3128）在监听，会自动走代理。企业网络可在 PowerShell 中先临时验证：
 
 ```powershell
 $env:https_proxy = "http://127.0.0.1:3128"
 venv\Scripts\python.exe main.py
 ```
 
-确认可用后，可通过 `setx HTTPS_PROXY "http://127.0.0.1:3128"` 写入当前用户环境变量，重启应用后生效。代理地址应以本机或组织实际配置为准。如无需在线语音，可仅使用 SAPI5 本地语音。
+确认可用后，可通过 `setx HTTPS_PROXY "http://127.0.0.1:3128"` 写入当前用户环境变量，重启应用后生效。代理地址应以本机或组织实际配置为准。若在线语音仍失败，应用会给出明确错误提示与「切换到本地 SAPI5 语音」的恢复入口；无需在线语音时可仅使用 SAPI5 本地语音。
+
 
 **Q: 打包后 SAPI5 语音不工作？**
 

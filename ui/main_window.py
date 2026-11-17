@@ -19,7 +19,7 @@ import queue
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pdf_reader import PDFReader, PDFDocument
-from tts_engine import TTSEngine, ReaderState
+from tts_engine import TTSEngine, ReaderState, EDGE_FATAL_ERROR_MESSAGE
 from reading_controller import ReadingController
 from voice_manager import VoiceManager
 from ui.text_panel import TextPanel
@@ -72,6 +72,7 @@ class PDFVoiceReaderApp:
                 self._tts_event_queue.put(("highlight", idx, page, sentence, start, end)),
             on_state_change=lambda state: self._tts_event_queue.put(("state_change", state)),
             on_finish=lambda: self._tts_event_queue.put(("finish", None)),
+            on_error=lambda msg: self._tts_event_queue.put(("error", msg)),
         )
 
         # 构建 UI
@@ -297,18 +298,22 @@ class PDFVoiceReaderApp:
             self.lbl_voice_count.config(text="未检测到语音引擎")
             return
 
+        display_names = self._voice_display_names()
+        self.control_panel.update_voices(display_names, select_index=0)
+        self.controller.set_voice(voices[0].id)
+        self.lbl_voice_count.config(text=f"共 {len(voices)} 个语音")
+
+    def _voice_display_names(self) -> list[str]:
+        """构建语音下拉框显示名（SAPI5 / Edge-TTS 统一格式）。"""
         display_names = []
-        for v in voices:
+        for v in self.voice_manager.voices:
             label = v.name
             if v.languages:
                 label += f"  [{v.languages}]"
             if v.provider == "edge":
                 label += " (在线)"
             display_names.append(label)
-
-        self.control_panel.update_voices(display_names, select_index=0)
-        self.controller.set_voice(voices[0].id)
-        self.lbl_voice_count.config(text=f"共 {len(voices)} 个语音")
+        return display_names
 
     def _on_voice_changed(self, event=None):
         idx = self.control_panel.current_voice_index
@@ -420,6 +425,8 @@ class PDFVoiceReaderApp:
                     self._on_event_state_change(args[0])
                 elif event_type == "finish":
                     self._on_event_finish()
+                elif event_type == "error":
+                    self._on_event_error(args[0])
         except queue.Empty:
             pass
         self.root.after(100, self._poll_tts_events)
@@ -446,6 +453,45 @@ class PDFVoiceReaderApp:
         self.control_panel.clear_progress()
         self.control_panel.update_play_button("idle")
         self._set_status("朗读完成")
+
+    def _on_event_error(self, message: str):
+        """TTS 引擎错误（worker 线程经队列送达主线程）。"""
+        # 状态栏先给出概要（可能较长，截断显示）
+        brief = message.splitlines()[0] if message else "语音引擎错误"
+        self._set_status(brief)
+
+        if message == EDGE_FATAL_ERROR_MESSAGE:
+            # Edge 在线语音连续失败：主动提供「切换到本地语音」的恢复路径，
+            # 避免用户遇到"无法朗读"时无从下手。
+            self._offer_local_voice_fallback()
+
+    def _offer_local_voice_fallback(self):
+        """Edge-TTS 不可用时，询问是否切换到本地 SAPI5 语音继续朗读。"""
+        if not messagebox.askyesno(
+            "在线语音不可用",
+            "Edge-TTS 连续多次合成失败，已停止朗读。\n\n"
+            "是否切换到本地语音（SAPI5）从当前页继续朗读？",
+        ):
+            return
+
+        voices = self.voice_manager.voices
+        local_idx = next((i for i, v in enumerate(voices) if v.provider == "sapi5"), -1)
+        if local_idx < 0:
+            messagebox.showwarning(
+                "提示",
+                "未检测到本地 SAPI5 语音包。\n"
+                "请在 Windows 设置 → 时间和语言 → 语音 中安装中文语音包后重试。",
+            )
+            return
+
+        # 同步下拉框选中项并切换引擎
+        self.control_panel.update_voices(self._voice_display_names(), select_index=local_idx)
+        self.controller.set_voice(voices[local_idx].id)
+        self._set_status(f"已切换到本地语音：{voices[local_idx].name}")
+
+        # 从当前页重新开始朗读
+        if self.pdf_doc:
+            self._start_playback()
 
     # ==================================================================
     # 工具方法
