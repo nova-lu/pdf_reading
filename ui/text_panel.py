@@ -5,12 +5,13 @@
 - 显示 PDF 当前页面文本（按段落排版）
 - 句子高亮（朗读进度同步，基于 clean_text 偏移精确定位）
 - 选中文本朗读（右键菜单）
+- 字号缩放与字体切换（标题栏控件 + Ctrl+滚轮，配置持久化由主窗口负责）
 - 空状态提示
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext
-from typing import Optional, Callable
+from tkinter import ttk, scrolledtext, font as tkfont
+from typing import Callable, Optional
 
 
 class TextPanel:
@@ -22,6 +23,20 @@ class TextPanel:
     COLOR_TEXT = "#1e293b"
     COLOR_TEXT_MUTED = "#64748b"
 
+    # 字号范围（正文字号；标题自动 +2，占位提示 +1）
+    FONT_SIZE_MIN = 12
+    FONT_SIZE_MAX = 48
+    FONT_SIZE_STEP = 2
+    DEFAULT_FONT_SIZE = 16
+    DEFAULT_FONT_FAMILY = "微软雅黑"
+
+    # 候选字体（按可用性过滤后展示）：中文阅读优先，其次西文
+    FONT_FAMILY_CANDIDATES = [
+        "微软雅黑", "Microsoft YaHei UI", "宋体", "楷体", "仿宋",
+        "等线", "黑体", "Noto Serif SC", "Noto Sans SC",
+        "Segoe UI", "Georgia", "Times New Roman", "Consolas",
+    ]
+
     def __init__(self, parent, styles):
         """
         Args:
@@ -30,11 +45,18 @@ class TextPanel:
         """
         self._styles = styles
         self._on_read_selection: Optional[Callable[[str], None]] = None
+        # 排版变化回调：(font_family, font_size) -> None，供主窗口持久化
+        self._on_typography_changed: Optional[Callable[[str, int], None]] = None
 
         # 当前页 clean_text（与高亮偏移计算保持一致）
         self._current_text: str = ""
         # 每个段落在 clean_text 中的 (start_offset, end_offset)
         self._paragraph_offsets: list[tuple[int, int]] = []
+
+        # 排版状态
+        self._font_family: str = self.DEFAULT_FONT_FAMILY
+        self._font_size: int = self.DEFAULT_FONT_SIZE
+        self._available_families: list[str] = self._detect_font_families()
 
         panel = ttk.Frame(parent, style="Panel.TFrame")
         panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
@@ -49,6 +71,36 @@ class TextPanel:
         self.lbl_page_info = ttk.Label(header, text="", style="Panel.TLabel", foreground=self.COLOR_TEXT_MUTED)
         self.lbl_page_info.pack(side=tk.RIGHT)
 
+        # ---- 排版控件（从右往左：页码 | A+ 字号 A- | 字体下拉）----
+        self.btn_font_plus = tk.Button(
+            header, text="A+", font=("Microsoft YaHei UI", 9),
+            bg="#e2e8f0", fg=self.COLOR_TEXT, activebackground="#cbd5e1",
+            relief=tk.FLAT, bd=0, padx=7, pady=2, cursor="hand2",
+            command=self.zoom_in,
+        )
+        self.btn_font_plus.pack(side=tk.RIGHT, padx=(6, 0))
+
+        self.lbl_font_size = ttk.Label(
+            header, text=str(self._font_size), style="Panel.TLabel",
+            foreground=self.COLOR_TEXT_MUTED, width=3, anchor=tk.CENTER,
+        )
+        self.lbl_font_size.pack(side=tk.RIGHT, padx=(2, 0))
+
+        self.btn_font_minus = tk.Button(
+            header, text="A-", font=("Microsoft YaHei UI", 9),
+            bg="#e2e8f0", fg=self.COLOR_TEXT, activebackground="#cbd5e1",
+            relief=tk.FLAT, bd=0, padx=7, pady=2, cursor="hand2",
+            command=self.zoom_out,
+        )
+        self.btn_font_minus.pack(side=tk.RIGHT, padx=(8, 0))
+
+        self.combo_font = ttk.Combobox(
+            header, state="readonly", width=11, values=self._available_families,
+        )
+        self.combo_font.set(self._font_family)
+        self.combo_font.pack(side=tk.RIGHT)
+        self.combo_font.bind("<<ComboboxSelected>>", self._on_family_selected)
+
         # 文本区域
         text_frame = ttk.Frame(panel, style="Panel.TFrame")
         text_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
@@ -56,7 +108,7 @@ class TextPanel:
         self.text_area = scrolledtext.ScrolledText(
             text_frame,
             wrap=tk.WORD,
-            font=("Segoe UI", 12),
+            font=(self._font_family, self._font_size),
             bg=self.COLOR_PANEL,
             fg=self.COLOR_TEXT,
             relief=tk.FLAT,
@@ -73,31 +125,140 @@ class TextPanel:
         )
         self.text_area.pack(fill=tk.BOTH, expand=True)
 
-        # 段落样式：段间距 + 首行缩进
-        self.text_area.tag_configure(
-            "paragraph",
-            spacing1=6,
-            spacing3=6,
-            lmargin1=24,
-            lmargin2=24,
-        )
-        # 标题/小标题样式（简短独立块）
-        self.text_area.tag_configure(
-            "heading",
-            spacing1=10,
-            spacing3=8,
-            lmargin1=0,
-            lmargin2=0,
-            font=("Segoe UI", 12, "bold"),
-        )
+        # 段落 / 标题 / 占位样式（字体在 _apply_typography 中按字号统一设置）
+        self.text_area.tag_configure("paragraph")
+        self.text_area.tag_configure("heading")
         # 高亮标签
         self.text_area.tag_configure("highlight", background=self.COLOR_HIGHLIGHT, foreground=self.COLOR_TEXT)
-        self.text_area.tag_configure("placeholder", foreground=self.COLOR_TEXT_MUTED, justify=tk.CENTER,
-                                     font=("Microsoft YaHei UI", 13))
+        self.text_area.tag_configure("placeholder", foreground=self.COLOR_TEXT_MUTED, justify=tk.CENTER)
 
         # 绑定选择和右键菜单
         self._bind_context_menu()
+        # Ctrl+滚轮缩放
+        self.text_area.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
+        # 应用初始排版
+        self._apply_typography()
         self._show_placeholder()
+
+    # ------------------------------------------------------------------
+    # 排版：字号 / 字体
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_font_families() -> list[str]:
+        """按候选顺序返回系统实际安装的字体（保证下拉框不会出现无效字体）。"""
+        try:
+            installed = set(tkfont.families())
+        except tk.TclError:
+            installed = set()
+        families = [f for f in TextPanel.FONT_FAMILY_CANDIDATES if f in installed]
+        if not families:
+            families = [TextPanel.DEFAULT_FONT_FAMILY]
+        return families
+
+    def _apply_typography(self):
+        """把当前字体/字号应用到文本控件与各标签。
+
+        Text widget 的 tag 字体优先级高于控件默认字体，因此段落、标题、
+        占位提示都需要显式设置，否则调整字号后部分文本不会变化。
+        """
+        family, size = self._font_family, self._font_size
+        self.text_area.configure(font=(family, size))
+
+        indent = max(0, int(size * 1.5))
+        self.text_area.tag_configure(
+            "paragraph",
+            spacing1=max(2, int(size * 0.45)),
+            spacing3=max(2, int(size * 0.45)),
+            lmargin1=indent,
+            lmargin2=indent,
+        )
+        self.text_area.tag_configure(
+            "heading",
+            spacing1=max(4, int(size * 0.6)),
+            spacing3=max(2, int(size * 0.5)),
+            lmargin1=0,
+            lmargin2=0,
+            font=(family, size + 2, "bold"),
+        )
+        self.text_area.tag_configure(
+            "placeholder",
+            font=(family, size + 1),
+        )
+        self.lbl_font_size.config(text=str(size))
+
+    def _notify_typography_changed(self):
+        self.combo_font.set(self._font_family)
+        if self._on_typography_changed:
+            try:
+                self._on_typography_changed(self._font_family, self._font_size)
+            except Exception:
+                pass
+
+    def _on_family_selected(self, event=None):
+        family = self.combo_font.get()
+        if family:
+            self.set_font_family(family)
+
+    def _on_ctrl_mousewheel(self, event):
+        """Ctrl+滚轮缩放（Windows 下 delta 为 120 的整数倍）。"""
+        if event.delta > 0:
+            self.zoom_in()
+        elif event.delta < 0:
+            self.zoom_out()
+        return "break"
+
+    def set_font_family(self, family: str):
+        """设置正文字体（无效字体静默忽略）。"""
+        if not family or family == self._font_family:
+            return
+        if family not in self._available_families:
+            return
+        self._font_family = family
+        self._apply_typography()
+        self._notify_typography_changed()
+
+    def set_font_size(self, size: int):
+        """设置正文字号（自动夹取到允许范围并取整）。"""
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return
+        size = max(self.FONT_SIZE_MIN, min(self.FONT_SIZE_MAX, size))
+        if size == self._font_size:
+            return
+        self._font_size = size
+        self._apply_typography()
+        self._notify_typography_changed()
+
+    def zoom_in(self):
+        self.set_font_size(self._font_size + self.FONT_SIZE_STEP)
+
+    def zoom_out(self):
+        self.set_font_size(self._font_size - self.FONT_SIZE_STEP)
+
+    def reset_zoom(self):
+        """恢复默认字体与字号。"""
+        self._font_family = self.DEFAULT_FONT_FAMILY
+        self._font_size = self.DEFAULT_FONT_SIZE
+        self._apply_typography()
+        self._notify_typography_changed()
+
+    def set_on_typography_changed(self, callback: Optional[Callable[[str, int], None]]):
+        """注册排版变化回调（主窗口用于持久化配置）。"""
+        self._on_typography_changed = callback
+
+    @property
+    def font_family(self) -> str:
+        return self._font_family
+
+    @property
+    def font_size(self) -> int:
+        return self._font_size
+
+    @property
+    def available_families(self) -> list[str]:
+        return list(self._available_families)
 
     def _bind_context_menu(self):
         """绑定右键菜单。"""
@@ -173,7 +334,8 @@ class TextPanel:
                               "    Ctrl+O  打开文件\n"
                               "    空格    播放/暂停\n"
                               "    Esc    停止朗读\n"
-                              "    ← / →  上一句 / 下一句")
+                              "    ← / →  上一句 / 下一句\n"
+                              "    Ctrl + 滚轮  缩放正文字号")
         self.text_area.tag_add("placeholder", "1.0", tk.END)
         self.text_area.config(state=tk.DISABLED)
 

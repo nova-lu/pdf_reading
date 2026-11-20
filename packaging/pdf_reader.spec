@@ -59,8 +59,14 @@ a = Analysis(
 
 # 收集需要完整打包的第三方库（包括数据文件和子模块）
 from PyInstaller.utils.hooks import collect_all
+import importlib.util
 
-for package in ('edge_tts', 'pyttsx3', 'pymupdf', 'aiohttp'):
+_packages = ['edge_tts', 'pyttsx3', 'pymupdf', 'aiohttp']
+# sherpa-onnx 为可选依赖（本地神经语音），未安装时跳过，不影响打包
+if importlib.util.find_spec('sherpa_onnx') is not None:
+    _packages.append('sherpa_onnx')
+
+for package in _packages:
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     a.datas += pkg_datas
     a.binaries += pkg_binaries

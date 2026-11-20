@@ -5,14 +5,15 @@ Windows 桌面端 PDF 语音朗读应用，支持打开 PDF 文档并使用 TTS 
 ## 功能特性
 
 - **PDF 文档解析**：基于 PyMuPDF，支持普通 PDF 和加密 PDF（自动尝试空密码），按段落保留排版；**字符保真**——希腊字母、数学运算符、箭头、Unicode 分数、上下标等原样保留，不改写、不做 Unicode 归一化
-- **双引擎语音朗读**：SAPI5 本地语音 + Edge-TTS 在线神经语音（共 9 个语音可选）
+- **三类语音引擎**：SAPI5 系统语音（离线）+ 本地神经语音（sherpa-onnx 模型，可下载，完全离线）+ Edge-TTS 在线音色（325 个，含 14 个中文），支持一键切换
+- **正文字号与字体可调**：标题栏 `A- / A+`、`Ctrl + 滚轮`、`Ctrl + = / - / 0`、`视图` 菜单；字号 12–48 pt，字体可选微软雅黑 / 宋体 / 楷体 / 仿宋 / Noto / Segoe UI 等，设置自动保存
 - **播放控制**：播放 / 暂停 / 恢复 / 停止，上一句 / 下一句跳转，进度条拖拽跳转
-- **高亮同步**：当前朗读句子黄色高亮，与音频严格同步（基于 SAPI5 `started-word` 事件 / Edge-TTS MCI 播放状态）
+- **高亮同步**：当前朗读句子黄色高亮，与音频严格同步（基于 SAPI5 `started-word` 事件 / MCI 播放状态）
 - **朗读范围**：可选朗读全文或仅当前页，支持从任意页开始
 - **选中文本朗读**：选中文本后右键或点按钮即可朗读选中内容
 - **页面导航**：上一页 / 下一页 / 跳转指定页，跨页朗读自动翻页
 - **参数调节**：语速（50-400）、音量（0-100%）实时调节
-- **快捷键**：Ctrl+O 打开文件、空格 播放/暂停、Esc 停止、←/→ 上一句/下一句
+- **快捷键**：Ctrl+O 打开文件、空格 播放/暂停、Esc 停止、←/→ 上一句/下一句、Ctrl+= / Ctrl+- 缩放字号
 
 ## 技术栈
 
@@ -20,9 +21,30 @@ Windows 桌面端 PDF 语音朗读应用，支持打开 PDF 文档并使用 TTS 
 |------|------|------|
 | PDF 解析 | PyMuPDF | 快速可靠的 PDF 文本提取，按 block 保留段落结构 |
 | 本地语音 | pyttsx3 + SAPI5 | Windows 系统自带，离线可用 |
+| 本地神经语音 | sherpa-onnx (<2.0) | ONNX 模型本地推理，模型可下载，中英混读；无需 GPU |
 | 在线语音 | edge-tts | 微软 Edge 神经语音，音质更好 |
 | GUI 界面 | tkinter + ttk | Python 内置，无需额外安装 |
 | 线程模型 | threading + queue | TTS 在 worker 线程运行，UI 通过队列更新 |
+| 配置持久化 | JSON (%APPDATA%) | 字号 / 字体 / 上次使用语音 |
+
+## 本地语音模型（可下载，离线运行）
+
+「工具 → 本地语音模型…」中可一键下载以下模型，下载完成后自动出现在语音下拉框
+（标注「本地神经」）。模型保存在 `%APPDATA%\PDFVoiceReader\models\`，删掉应用
+不影响已下载模型。
+
+| 模型 | 语言 | 体积 | 适用场景 |
+|------|------|------|----------|
+| 小雅 中文女声（int8，推荐） | zh-CN | ≈14 MB | 纯中文书籍，体积小、加载快 |
+| 超文 中文男声（int8） | zh-CN | ≈14 MB | 纯中文书籍，男声 |
+| Amy 英文女声（int8，推荐） | en-US | ≈21 MB | 纯英文书籍，女声 |
+| Ryan 英文男声（int8） | en-US | ≈21 MB | 纯英文书籍，男声 |
+| Melo 中英混读（女声，高质量） | zh-CN + en-US | ≈159 MB | 中英夹杂的技术书，混读最自然 |
+
+- int8 为量化版本：体积约为 fp32 的 1/3，CPU 推理更快，音质损失很小。
+- 断点续传：下载中断后再次点击「下载」会从断点继续。
+- 完全离线：合成在本机 CPU 完成，文本不会上传。
+- 依赖：`sherpa-onnx>=1.12,<2.0`（**不要升到 2.x**：2.0 起废弃 espeak 音素数据，英文 Piper 模型会读不出正确发音）。
 
 ## 快速开始
 
@@ -56,14 +78,17 @@ pdf_voice_reader/
 ├── math_unicode.py            # Unicode 数学字符工具（上下标映射、区块识别、字符画像）
 ├── tts_normalizer.py          # 朗读层规范化（符号 → 中文读法，仅发声时使用）
 ├── edge_tts_compat.py         # edge-tts 端点迁移兼容层（v1→v2 主机回退 + Date 解析修复）
-├── tts_engine.py              # TTS 引擎（双后端 SAPI5 + Edge-TTS）
-├── voice_manager.py           # 统一语音管理
+├── local_tts.py               # 本地神经语音（sherpa-onnx 模型下载/扫描/合成）
+├── tts_engine.py              # TTS 引擎（三后端 SAPI5 + 本地神经 + Edge-TTS）
+├── voice_manager.py           # 统一语音管理（Edge 音色动态枚举 + 本地缓存）
+├── settings_store.py          # 用户偏好持久化（字号/字体/上次语音）
 ├── reading_controller.py      # 页面感知朗读控制
 ├── ui/
 │   ├── __init__.py
 │   ├── main_window.py         # 主窗口编排
-│   ├── text_panel.py          # 文本预览面板（段落排版 + 高亮 + 选择朗读）
-│   └── control_panel.py       # 控制面板（播放控制 + 可拖拽进度 + 语音设置）
+│   ├── text_panel.py          # 文本预览面板（段落排版 + 高亮 + 字号字体缩放）
+│   ├── control_panel.py       # 控制面板（播放控制 + 可拖拽进度 + 语音设置）
+│   └── model_manager.py       # 本地语音模型管理对话框（下载/进度/删除）
 ├── packaging/                  # 打包相关（与源码解耦）
 │   ├── build_exe.py           # 自动化打包脚本
 │   ├── pdf_reader.spec        # PyInstaller spec 配置（参考）
@@ -73,6 +98,7 @@ pdf_voice_reader/
 ├── test_text_fidelity.py      # 字符保真度测试（82 项）
 ├── test_tts_normalizer.py     # 朗读规范化测试（58 项）
 ├── test_edge_tts_compat.py    # edge-tts 兼容层回归测试（27 项，离线）
+├── test_typography.py         # 字号/字体缩放测试（离线）
 ├── e2e_test.py                # 端到端测试（多场景，会实际发声）
 ├── .gitignore
 └── README.md

@@ -15,6 +15,8 @@ from tkinter import ttk, filedialog, messagebox
 import os
 import sys
 import queue
+import threading
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,8 +24,10 @@ from pdf_reader import PDFReader, PDFDocument
 from tts_engine import TTSEngine, ReaderState, EDGE_FATAL_ERROR_MESSAGE
 from reading_controller import ReadingController
 from voice_manager import VoiceManager
+from settings_store import load_settings, save_settings
 from ui.text_panel import TextPanel
 from ui.control_panel import ControlPanel
+from ui.model_manager import ModelManagerDialog
 
 
 class PDFVoiceReaderApp:
@@ -62,6 +66,11 @@ class PDFVoiceReaderApp:
         # PDF 文档
         self.pdf_doc: PDFDocument | None = None
 
+        # 用户偏好（字号 / 字体等），随用随存
+        self._settings: dict = load_settings()
+        # 排版变化的持久化防抖句柄（滚轮连续缩放时避免频繁写盘）
+        self._save_typography_job = None
+
         # TTS 事件队列（worker 线程 -> 主线程）
         self._tts_event_queue: queue.Queue = queue.Queue()
 
@@ -75,14 +84,20 @@ class PDFVoiceReaderApp:
             on_error=lambda msg: self._tts_event_queue.put(("error", msg)),
         )
 
-        # 构建 UI
-        self._build_menu()
+        # 构建 UI（先建布局再建菜单：视图菜单需要用到 TextPanel 的可用字体列表）
         self._build_main_layout()
+        self._build_menu()
         self._build_status_bar()
         self._apply_styles()
 
+        # 恢复上次的字号/字体，并接管排版变化回调（放在恢复之后，避免启动时误报状态）
+        self._restore_typography()
+        self.text_panel.set_on_typography_changed(self._on_typography_changed)
+
         # 初始化语音列表
         self._refresh_voice_list()
+        # 后台补齐 Edge 完整音色（首次启动 / 缓存过期时）
+        self._start_edge_voice_refresh()
 
         # 窗口关闭处理
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -129,6 +144,26 @@ class PDFVoiceReaderApp:
         file_menu.add_command(label="退出", command=self._on_close)
         menubar.add_cascade(label="文件", menu=file_menu)
 
+        # 视图菜单：字号缩放 + 正文字体
+        view_menu = tk.Menu(menubar, tearoff=False)
+        view_menu.add_command(label="放大字体", command=self._zoom_in, accelerator="Ctrl+=")
+        view_menu.add_command(label="缩小字体", command=self._zoom_out, accelerator="Ctrl+-")
+        view_menu.add_command(label="恢复默认字号", command=self._reset_zoom, accelerator="Ctrl+0")
+        view_menu.add_separator()
+        font_menu = tk.Menu(view_menu, tearoff=False)
+        for family in self.text_panel.available_families:
+            font_menu.add_command(
+                label=family,
+                command=lambda f=family: self._set_font_family(f),
+            )
+        view_menu.add_cascade(label="正文字体", menu=font_menu)
+        menubar.add_cascade(label="视图", menu=view_menu)
+
+        # 工具菜单：本地语音模型管理
+        tools_menu = tk.Menu(menubar, tearoff=False)
+        tools_menu.add_command(label="本地语音模型…", command=self._open_model_manager)
+        menubar.add_cascade(label="工具", menu=tools_menu)
+
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="关于", command=self._show_about)
         menubar.add_cascade(label="帮助", menu=help_menu)
@@ -141,6 +176,11 @@ class PDFVoiceReaderApp:
         self.root.bind("<Escape>", lambda e: self._stop_reading())
         self.root.bind("<Left>", lambda e: self._skip_prev())
         self.root.bind("<Right>", lambda e: self._skip_next())
+        # 字号缩放：Ctrl+= / Ctrl+- / Ctrl+0（兼容主键盘与小键盘）
+        self.root.bind("<Control-equal>", lambda e: self._zoom_in())
+        self.root.bind("<Control-plus>", lambda e: self._zoom_in())
+        self.root.bind("<Control-minus>", lambda e: self._zoom_out())
+        self.root.bind("<Control-Key-0>", lambda e: self._reset_zoom())
 
     # ==================================================================
     # 主布局
@@ -200,6 +240,49 @@ class PDFVoiceReaderApp:
 
         self.lbl_voice_count = ttk.Label(bar, text="", style="Status.TLabel")
         self.lbl_voice_count.pack(side=tk.RIGHT)
+
+    # ==================================================================
+    # 阅读排版（字号 / 字体）
+    # ==================================================================
+
+    def _restore_typography(self):
+        """启动时恢复上次保存的字号与字体（无效值自动忽略）。"""
+        family = self._settings.get("font_family")
+        size = self._settings.get("font_size")
+        if isinstance(family, str) and family in self.text_panel.available_families:
+            self.text_panel.set_font_family(family)
+        if isinstance(size, int):
+            self.text_panel.set_font_size(size)
+
+    def _on_typography_changed(self, family: str, size: int):
+        """TextPanel 排版变化 -> 状态栏提示 + 防抖持久化。"""
+        self._settings["font_family"] = family
+        self._settings["font_size"] = size
+        self._set_status(f"字号 {size} pt · 字体 {family}")
+
+        if self._save_typography_job is not None:
+            try:
+                self.root.after_cancel(self._save_typography_job)
+            except tk.TclError:
+                pass
+        # 滚轮连续缩放时合并写盘
+        self._save_typography_job = self.root.after(400, self._persist_typography)
+
+    def _persist_typography(self):
+        self._save_typography_job = None
+        save_settings(self._settings)
+
+    def _zoom_in(self):
+        self.text_panel.zoom_in()
+
+    def _zoom_out(self):
+        self.text_panel.zoom_out()
+
+    def _reset_zoom(self):
+        self.text_panel.reset_zoom()
+
+    def _set_font_family(self, family: str):
+        self.text_panel.set_font_family(family)
 
     # ==================================================================
     # PDF 文件操作
@@ -292,35 +375,62 @@ class PDFVoiceReaderApp:
     # ==================================================================
 
     def _refresh_voice_list(self):
+        """构建语音下拉列表（优先恢复上次使用的语音）。"""
+        self._rebuild_voice_combobox(preferred_id=self._settings.get("voice_id"))
+
+    def _voice_display_names(self) -> list[str]:
+        """语音显示名（VoiceInfo.name 已自带后端标识：本地 SAPI5 / 本地神经 / 在线）。"""
+        return [v.name for v in self.voice_manager.voices]
+
+    def _rebuild_voice_combobox(self, preferred_id: Optional[str] = None):
+        """重建语音下拉框并尽量保持原选中项。"""
         voices = self.voice_manager.voices
         if not voices:
             self.control_panel.update_voices(["（无可用语音）"])
             self.lbl_voice_count.config(text="未检测到语音引擎")
             return
 
-        display_names = self._voice_display_names()
-        self.control_panel.update_voices(display_names, select_index=0)
-        self.controller.set_voice(voices[0].id)
-        self.lbl_voice_count.config(text=f"共 {len(voices)} 个语音")
+        if not preferred_id:
+            preferred_id = self.tts.voice_id
+        idx = next((i for i, v in enumerate(voices) if v.id == preferred_id), 0)
 
-    def _voice_display_names(self) -> list[str]:
-        """构建语音下拉框显示名（SAPI5 / Edge-TTS 统一格式）。"""
-        display_names = []
-        for v in self.voice_manager.voices:
-            label = v.name
-            if v.languages:
-                label += f"  [{v.languages}]"
-            if v.provider == "edge":
-                label += " (在线)"
-            display_names.append(label)
-        return display_names
+        self.control_panel.update_voices(self._voice_display_names(), select_index=idx)
+        self.controller.set_voice(voices[idx].id)
+        self.lbl_voice_count.config(text=f"共 {len(voices)} 个语音")
+        self._settings["voice_id"] = voices[idx].id
 
     def _on_voice_changed(self, event=None):
         idx = self.control_panel.current_voice_index
         voices = self.voice_manager.voices
         if 0 <= idx < len(voices):
             self.controller.set_voice(voices[idx].id)
+            self._settings["voice_id"] = voices[idx].id
+            save_settings(self._settings)
             self._set_status(f"已切换语音：{voices[idx].name}")
+
+    # ---- 本地模型 / Edge 音色更新 ----
+
+    def _open_model_manager(self):
+        """打开本地语音模型管理窗口。"""
+        ModelManagerDialog(self.root, on_models_changed=self._on_local_models_changed)
+
+    def _on_local_models_changed(self):
+        """模型安装/删除后刷新本地语音列表（保持当前选中项）。"""
+        self.voice_manager.reload_local_voices()
+        self.tts.refresh_voice_list()
+        self._rebuild_voice_combobox()
+        self._set_status("本地语音列表已更新")
+
+    def _start_edge_voice_refresh(self):
+        """后台刷新 Edge 完整音色列表（322+），完成后通过事件队列更新 UI。"""
+        if not self.voice_manager.edge_refresh_needed():
+            return
+
+        def worker():
+            if self.voice_manager.refresh_edge_voices_sync():
+                self._tts_event_queue.put(("voices_changed", None))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_rate_changed(self, value):
         rate = int(float(value))
@@ -427,6 +537,8 @@ class PDFVoiceReaderApp:
                     self._on_event_finish()
                 elif event_type == "error":
                     self._on_event_error(args[0])
+                elif event_type == "voices_changed":
+                    self._on_event_voices_changed()
         except queue.Empty:
             pass
         self.root.after(100, self._poll_tts_events)
@@ -436,6 +548,12 @@ class PDFVoiceReaderApp:
         self._display_page(page)
         self._update_page_controls()
         self._set_status(f"朗读中... 第 {page + 1} 页")
+
+    def _on_event_voices_changed(self):
+        """Edge 音色列表后台刷新完成：重建下拉框并保持当前选中项。"""
+        self.tts.refresh_voice_list()
+        self._rebuild_voice_combobox()
+        self._set_status(f"在线音色已更新（共 {self.voice_manager.count} 个语音）")
 
     def _on_event_highlight(self, index: int, page: int, sentence: str, start_offset: int = -1, end_offset: int = -1):
         """更新高亮和进度。"""
@@ -555,24 +673,34 @@ class PDFVoiceReaderApp:
     def _show_about(self):
         messagebox.showinfo(
             "关于",
-            "PDF 语音阅读助手 v2.0\n\n"
+            "PDF 语音阅读助手 v2.1\n\n"
             "功能：\n"
             "  - 打开并解析 PDF 文档\n"
             "  - 语音朗读（TTS）全文或指定页\n"
-            "  - 多语音切换（本地 SAPI5 + 在线 Edge-TTS）\n"
+            "  - 三类语音：SAPI5 本地 / 本地神经模型（可下载）/ Edge 在线（325 个音色）\n"
+            "  - 正文字号 12–48 pt 可调，支持字体切换\n"
             "  - 语速 / 音量调节\n"
             "  - 播放 / 暂停 / 停止 / 跳转控制\n"
             "  - 从指定页开始朗读\n"
             "  - 跨页自动翻页高亮\n\n"
-            "技术栈：Python + PyMuPDF + pyttsx3 + edge-tts + tkinter\n\n"
+            "技术栈：Python + PyMuPDF + pyttsx3 + sherpa-onnx + edge-tts + tkinter\n\n"
             "快捷键：\n"
             "  Ctrl+O  打开 PDF\n"
             "  空格    播放/暂停\n"
             "  Esc     停止朗读\n"
-            "  <- / -> 上一句 / 下一句",
+            "  <- / -> 上一句 / 下一句\n"
+            "  Ctrl+= / Ctrl+- / Ctrl+0  放大 / 缩小 / 重置字号",
         )
 
     def _on_close(self):
+        # 关闭前把尚未落盘的排版配置写完（防抖期间直接关窗会丢设置）
+        if self._save_typography_job is not None:
+            try:
+                self.root.after_cancel(self._save_typography_job)
+            except tk.TclError:
+                pass
+            self._save_typography_job = None
+            save_settings(self._settings)
         self.controller.shutdown()
         self.root.destroy()
 

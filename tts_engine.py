@@ -34,7 +34,15 @@ from typing import Callable, Optional
 
 # 确保能导入同目录模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from voice_manager import VoiceManager, VoiceInfo, EDGE_VOICE_PREFIX
+from voice_manager import VoiceManager, VoiceInfo, EDGE_VOICE_PREFIX, LOCAL_VOICE_PREFIX
+
+# 本地神经语音（可选依赖 sherpa-onnx；未安装时该后端不可用，其余功能不受影响）
+try:
+    import local_tts
+    _LOCAL_TTS_AVAILABLE = local_tts.is_available()
+except ImportError:
+    local_tts = None  # type: ignore[assignment]
+    _LOCAL_TTS_AVAILABLE = False
 
 # 尝试导入 edge-tts（可选依赖）。
 # 注意：先导入 edge_tts_compat——它会在 import 时把合成端点切换到
@@ -155,6 +163,8 @@ class TTSEngine:
         # 当前播放使用的后端和语音
         self._current_provider: str = "sapi5"
         self._current_edge_short_name: str = ""
+        # 本地神经语音模型 ID（provider == "local" 时有效）
+        self._current_local_model_id: str = ""
 
         # Edge-TTS 当前生效的参数（worker 启动时计算，预生成线程也会读取）
         self._edge_rate: int = 0
@@ -190,6 +200,10 @@ class TTSEngine:
     @property
     def voices(self) -> list[VoiceInfo]:
         return self._voices
+
+    def refresh_voice_list(self):
+        """语音列表变化后（模型安装/Edge 音色刷新）同步引擎内缓存。"""
+        self._voices = self._voice_manager.voices
 
     @property
     def state(self) -> ReaderState:
@@ -445,9 +459,11 @@ class TTSEngine:
         if voice:
             self._current_provider = voice.provider
             self._current_edge_short_name = voice.short_name
+            self._current_local_model_id = voice.short_name if voice.provider == "local" else ""
         else:
             self._current_provider = "sapi5"
             self._current_edge_short_name = ""
+            self._current_local_model_id = ""
 
         # 重置控制标志
         self._stop_flag.clear()
@@ -545,6 +561,8 @@ class TTSEngine:
         """工作线程入口，根据后端分发。"""
         if self._current_provider == "edge":
             self._run_edge_worker()
+        elif self._current_provider == "local":
+            self._run_local_worker()
         else:
             self._run_sapi5_worker()
 
@@ -922,6 +940,109 @@ class TTSEngine:
                 except Exception:
                     pass
 
+    # ------------------------------------------------------------------
+    # 本地神经语音后端（sherpa-onnx）
+    # ------------------------------------------------------------------
+
+    def _run_local_worker(self):
+        """本地模型朗读循环：逐句合成 WAV → MCI 播放（全程离线）。"""
+        if not _LOCAL_TTS_AVAILABLE or local_tts is None:
+            self._notify_error(
+                "本地神经语音不可用：未安装 sherpa-onnx。\n"
+                "请运行 pip install \"sherpa-onnx>=1.12,<2.0\" 后重启应用。"
+            )
+            self._set_state(ReaderState.IDLE)
+            return
+
+        model_id = self._current_local_model_id
+        if not model_id:
+            self._notify_error("本地神经语音不可用：未选择模型")
+            self._set_state(ReaderState.IDLE)
+            return
+
+        mci = ctypes.windll.winmm
+        alias = self._MCI_ALIAS
+        fail_streak = 0
+
+        # 语速：滑块 50~400（200 为原速）→ 倍率 0.5~2.0
+        speed = max(0.5, min(2.0, self._rate / 200.0))
+
+        while self._current_index < len(self._sentences):
+            if self._stop_flag.is_set():
+                break
+
+            if self._skip_to_index is not None:
+                self._current_index = self._skip_to_index
+                self._skip_to_index = None
+                self._mci_stop(mci, alias)
+                continue
+
+            self._pause_event.wait()
+            if self._stop_flag.is_set():
+                break
+
+            sentence = self._sentences[self._current_index]
+            if not sentence.strip():
+                self._current_index += 1
+                continue
+
+            temp_file = os.path.join(
+                tempfile.gettempdir(),
+                f"local_tts_{threading.get_ident()}_{self._current_index}.wav",
+            )
+            try:
+                local_tts.synthesize(
+                    model_id, self._speech_text(sentence), temp_file, speed=speed
+                )
+            except Exception as exc:
+                fail_streak += 1
+                if fail_streak == 1:
+                    self._notify_error(f"本地语音合成失败：{exc}")
+                elif fail_streak >= self.EDGE_MAX_CONSECUTIVE_FAILURES:
+                    self._notify_error(
+                        "本地神经语音连续多次合成失败，已停止朗读。\n"
+                        "请检查模型文件是否完整（可在「文件 → 本地语音模型…」中重新下载）。"
+                    )
+                    self._set_state(ReaderState.IDLE)
+                    break
+                self._current_index += 1
+                continue
+            fail_streak = 0
+
+            if self._stop_flag.is_set():
+                self._cleanup_temp(temp_file)
+                break
+
+            # WAV 用 waveaudio 设备类型打开（MP3 用的是 mpegvideo）
+            self._mci_open(mci, alias, temp_file, dev_type="waveaudio")
+            self._mci_send(mci, f"play {alias}")
+            self._mci_wait_playing(mci, alias, timeout=2.0)
+            if not self._stop_flag.is_set() and self._skip_to_index is None:
+                self._notify_sentence_start(self._current_index, sentence)
+
+            self._poll_edge_playback(mci, alias)
+            self._mci_stop(mci, alias)
+            self._cleanup_temp(temp_file)
+
+            if self._skip_to_index is not None:
+                self._current_index = self._skip_to_index
+                self._skip_to_index = None
+                continue
+
+            if self._stop_flag.is_set():
+                break
+
+            self._current_index += 1
+
+        # 朗读完成回调
+        if not self._stop_flag.is_set() and self._current_index >= len(self._sentences):
+            self._set_state(ReaderState.IDLE)
+            if self._on_finish:
+                try:
+                    self._on_finish()
+                except Exception:
+                    pass
+
     def _generate_edge_audio(self, text: str, voice_short_name: str, output_path: str, rate: int, volume_pct: int):
         """使用 Edge-TTS 生成音频文件。
 
@@ -1043,9 +1164,9 @@ class TTSEngine:
             return mci.mciSendStringW(command, ret_buf, 256, None)
         return mci.mciSendStringW(command, None, 0, None)
 
-    def _mci_open(self, mci, alias: str, file_path: str):
-        """打开 MCI 设备。"""
-        self._mci_send(mci, f'open "{file_path}" type mpegvideo alias {alias}')
+    def _mci_open(self, mci, alias: str, file_path: str, dev_type: str = "mpegvideo"):
+        """打开 MCI 设备（MP3 用 mpegvideo，WAV 用 waveaudio）。"""
+        self._mci_send(mci, f'open "{file_path}" type {dev_type} alias {alias}')
 
     def _mci_stop(self, mci, alias: str):
         """停止并关闭 MCI 设备。"""

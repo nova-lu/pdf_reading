@@ -33,6 +33,7 @@ PDF 语音阅读助手 - Windows EXE 自动化打包脚本
 """
 
 import argparse
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -166,6 +167,9 @@ def run_pyinstaller(python: str, output_dir: Path, build_cache: Path,
         "--exclude-module", "pydoc",
         "--exclude-module", "doctest",
     ]
+    # 可选依赖：本地神经语音（sherpa-onnx）。未安装时跳过，不影响其余功能打包。
+    if importlib.util.find_spec("sherpa_onnx") is not None:
+        cmd += ["--collect-all", "sherpa_onnx"]
     if not dir_mode:
         cmd.append("--onefile")
 

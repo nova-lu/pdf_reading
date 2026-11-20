@@ -2,3 +2,6 @@ PyMuPDF>=1.23.0
 pyttsx3>=2.90
 pywin32>=306
 edge-tts>=7.0.0
+# 本地神经语音（可选）：必须 <2.0——2.x 起废弃 data_dir（espeak 音素数据），
+# 英文 Piper 系列模型会无法正确发音
+sherpa-onnx>=1.12,<2.0
